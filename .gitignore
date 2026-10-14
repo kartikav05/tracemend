@@ -1,0 +1,43 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode and builds
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# TraceMend local state
+.tracemend/
+tracemend.sqlite3
+*.sqlite3
+*.bak
+
+# Environment files — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Local agent/assistant config and scratch planning notes
+.agents/
+.codex/
+.claude/
+plans/
+notes/
+
+# Logs
+*.log

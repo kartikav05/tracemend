@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="160" viewBox="0 0 600 160" role="img" aria-labelledby="logoTitle logoDesc">
+  <title id="logoTitle">TraceMend</title>
+  <desc id="logoDesc">A connected node trace whose final segment is repaired and highlighted in green, followed by the TraceMend wordmark.</desc>
+  <rect x="8" y="8" width="584" height="144" rx="24" fill="#0d1117" stroke="#e6edf3" stroke-opacity="0.14"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M56 120 V84 H92 V48" stroke="#58a6ff" stroke-width="8" stroke-opacity="0.62"/>
+    <path d="M92 48 H128" stroke="#3fb950" stroke-width="8"/>
+  </g>
+  <circle cx="56" cy="120" r="8" fill="#0d1117" stroke="#58a6ff" stroke-width="5.5" stroke-opacity="0.62"/>
+  <circle cx="92" cy="84" r="8" fill="#0d1117" stroke="#58a6ff" stroke-width="5.5" stroke-opacity="0.62"/>
+  <circle cx="92" cy="48" r="8" fill="#0d1117" stroke="#58a6ff" stroke-width="5.5" stroke-opacity="0.62"/>
+  <circle cx="128" cy="48" r="17" fill="#3fb950" fill-opacity="0.16"/>
+  <circle cx="128" cy="48" r="9" fill="#3fb950"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="172" y="84" font-size="56" font-weight="700" fill="#e6edf3" letter-spacing="0.5">Trace<tspan fill="#3fb950">Mend</tspan></text>
+    <text x="174" y="115" font-size="20" fill="#e6edf3" fill-opacity="0.62" letter-spacing="0.6">Find the waste. Fix the agent.</text>
+  </g>
+</svg>

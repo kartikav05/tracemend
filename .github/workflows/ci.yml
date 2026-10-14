@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest
+
+  container:
+    name: Container build and smoke test
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build image
+        shell: bash
+        run: docker build -t tracemend:ci .
+
+      - name: Entrypoint smoke test (--version, --help)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none tracemend:ci --version
+          docker run --rm --network none tracemend:ci --help > /dev/null
+
+      - name: Analyze a baked-in fixture offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none tracemend:ci analyze /app/examples/inefficient_run.json --format json | python3 -c "import json, sys; json.load(sys.stdin)"
+
+      - name: Compare the baked-in fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none tracemend:ci compare /app/examples/inefficient_run.json /app/examples/optimized_run.json --format json | python3 -c "import json, sys; json.load(sys.stdin)"
+
+      - name: Reuse state across containers through the /data volume
+        id: state_volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          analysis=$(docker run --rm --network none -v tracemend-ci-state:/data tracemend:ci analyze /app/examples/inefficient_run.json --format json)
+          run_id=$(printf '%s' "$analysis" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')
+          finding_id=$(printf '%s' "$analysis" | python3 -c 'import json, sys; print(next(f["id"] for f in json.load(sys.stdin)["findings"] if f.get("fixable") and f["code"] in ("TM001", "TM002", "TM003", "TM004")))')
+          echo "analyzed $run_id with fixable finding $finding_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "finding_id=$finding_id" >> "$GITHUB_OUTPUT"
+
+          # A second, separate container must see the SQLite state written by the first.
+          findings=$(docker run --rm --network none -v tracemend-ci-state:/data tracemend:ci findings "$run_id" --format json)
+          printf '%s' "$findings" | RUN_ID="$run_id" python3 -c 'import json, os, sys; data = json.load(sys.stdin); assert data["run_id"] == os.environ["RUN_ID"], data; assert data["count"] > 0, data; print("second container read", data["count"], "findings for", data["run_id"])'
+
+      - name: Enforce the human approval boundary (fix propose, diff, approve)
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace=$(mktemp -d)
+          chmod 0755 "$workspace"
+          cp examples/AGENTS.md "$workspace/AGENTS.md"
+          chmod 0644 "$workspace/AGENTS.md"
+          before=$(sha256sum "$workspace/AGENTS.md" | awk '{print $1}')
+
+          proposal=$(docker run --rm --network none -v "$workspace:/workspace" -w /workspace -v tracemend-ci-state:/data tracemend:ci fix propose "${{ steps.state_volume.outputs.run_id }}" "${{ steps.state_volume.outputs.finding_id }}" --workspace /workspace --format json)
+          proposal_id=$(printf '%s' "$proposal" | python3 -c 'import json, sys; print(json.load(sys.stdin)["proposal_id"])')
+          echo "proposed $proposal_id"
+
+          diff=$(docker run --rm --network none -v "$workspace:/workspace" -w /workspace -v tracemend-ci-state:/data tracemend:ci fix diff "$proposal_id" --format json)
+          printf '%s' "$diff" | python3 -c 'import json, sys; data = json.load(sys.stdin); assert data["diff"].strip(), "proposal diff is empty"'
+
+          after=$(sha256sum "$workspace/AGENTS.md" | awk '{print $1}')
+          if [ "$before" != "$after" ]; then
+            echo "fix propose/diff must not modify AGENTS.md"
+            exit 1
+          fi
+          echo "AGENTS.md unchanged after propose and diff"
+
+          # No -i and no -t below, so stdin is not a TTY and approval must refuse.
+          if docker run --rm --network none -v "$workspace:/workspace" -w /workspace -v tracemend-ci-state:/data tracemend:ci fix approve "$proposal_id"; then
+            echo "expected refusal but the approval succeeded"
+            exit 1
+          fi
+          echo "fix approve correctly refused without a TTY"

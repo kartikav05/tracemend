@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="944" viewBox="0 0 1000 944" role="img" aria-labelledby="archTitle archDesc">
+  <title id="archTitle">TraceMend architecture</title>
+  <desc id="archDesc">Two front ends (CLI and MCP server) share one service layer: trace ingestion adapters feed the analyzer and detectors, which produce reports and a fix pipeline guarded by security.py, with runs, findings, proposals and patches in a local SQLite store.</desc>
+  <rect x="6" y="6" width="988" height="932" rx="18" fill="#0d1117" stroke="#30363d"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <rect x="40" y="32" width="920" height="118" rx="14" fill="#12181f" stroke="#30363d" stroke-dasharray="6 5"/>
+    <text x="60" y="58" font-size="12.5" fill="#8b949e" letter-spacing="1.4">FRONT ENDS</text>
+    <rect x="40" y="186" width="920" height="154" rx="14" fill="#12181f" stroke="#30363d" stroke-dasharray="6 5"/>
+    <text x="60" y="212" font-size="12.5" fill="#8b949e" letter-spacing="1.4">TRACE INGESTION</text>
+    <rect x="40" y="380" width="920" height="216" rx="14" fill="#12181f" stroke="#30363d" stroke-dasharray="6 5"/>
+    <text x="60" y="406" font-size="12.5" fill="#8b949e" letter-spacing="1.4">SHARED SERVICE LAYER</text>
+    <rect x="40" y="636" width="560" height="116" rx="14" fill="#12181f" stroke="#30363d" stroke-dasharray="6 5"/>
+    <text x="60" y="662" font-size="12.5" fill="#8b949e" letter-spacing="1.4">GUARDS</text>
+    <rect x="40" y="776" width="920" height="136" rx="14" fill="#12181f" stroke="#30363d" stroke-dasharray="6 5"/>
+    <text x="60" y="802" font-size="12.5" fill="#8b949e" letter-spacing="1.4">LOCAL STATE</text>
+    <rect x="62" y="78" width="128" height="46" rx="23.0" fill="#1a2129" stroke="#30363d"/>
+    <text x="126.0" y="105.5" text-anchor="middle" font-size="12" fill="#e6edf3">Human at a TTY</text>
+    <rect x="262" y="74" width="250" height="54" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="387.0" y="106.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">CLI (click)</text>
+    <rect x="552" y="74" width="300" height="54" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="702.0" y="106.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">MCP server (stdio)</text>
+    <polyline points="192.0,101.0 262.0,101.0" fill="none" stroke="#8b949e" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4 4"/>
+    <path d="M262.0 101.0L252.0 105.2L252.0 96.8Z" fill="#8b949e"/>
+    <text x="196" y="93" text-anchor="start" font-size="10.5" fill="#8b949e">fix approve</text>
+    <rect x="262" y="254" width="200" height="56" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="362.0" y="287.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">Format detection</text>
+    <rect x="552" y="222" width="150" height="44" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="627.0" y="248.9" text-anchor="middle" font-size="13.5" font-weight="700" fill="#e6edf3">generic.py</text>
+    <rect x="552" y="288" width="150" height="44" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="627.0" y="314.9" text-anchor="middle" font-size="13.5" font-weight="700" fill="#e6edf3">opencode.py</text>
+    <polyline points="330.0,128.0 330.0,254.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M330.0 254.0L325.8 244.0L334.2 244.0Z" fill="#58a6ff"/>
+    <polyline points="702.0,128.0 702.0,166.0 400.0,166.0 400.0,254.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M400.0 254.0L395.8 244.0L404.2 244.0Z" fill="#58a6ff"/>
+    <polyline points="462.0,282.0 502.0,282.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M502.0 282.0L492.0 286.2L492.0 277.8Z" fill="#58a6ff"/>
+    <polyline points="502.0,282.0 502.0,244.0 552.0,244.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M552.0 244.0L542.0 248.2L542.0 239.8Z" fill="#58a6ff"/>
+    <polyline points="502.0,282.0 502.0,310.0 552.0,310.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M552.0 310.0L542.0 314.2L542.0 305.8Z" fill="#58a6ff"/>
+    <rect x="62" y="424" width="200" height="104" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <rect x="62" y="424" width="4" height="104" rx="2" fill="#58a6ff"/>
+    <text x="162.0" y="452.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">analyzer.py</text>
+    <text x="162.0" y="471.7" text-anchor="middle" font-size="11" fill="#8b949e">metrics +</text>
+    <text x="162.0" y="486.7" text-anchor="middle" font-size="11" fill="#8b949e">orchestration</text>
+    <rect x="302" y="424" width="160" height="104" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <rect x="302" y="424" width="4" height="104" rx="2" fill="#58a6ff"/>
+    <text x="382.0" y="451.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">detectors.py</text>
+    <text x="382.0" y="470.7" text-anchor="middle" font-size="11" fill="#8b949e">TM001–TM005</text>
+    <rect x="522" y="424" width="178" height="64" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="611.0" y="450.9" text-anchor="middle" font-size="13.5" font-weight="700" fill="#e6edf3">reports.py</text>
+    <text x="611.0" y="470.4" text-anchor="middle" font-size="11" fill="#8b949e">Rich + JSON</text>
+    <rect x="522" y="500" width="178" height="72" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <rect x="522" y="500" width="4" height="72" rx="2" fill="#3fb950"/>
+    <text x="611.0" y="527.9" text-anchor="middle" font-size="13.5" font-weight="700" fill="#e6edf3">fixes.py</text>
+    <text x="611.0" y="547.4" text-anchor="middle" font-size="11" fill="#8b949e">propose · approve</text>
+    <text x="611.0" y="562.4" text-anchor="middle" font-size="11" fill="#8b949e">apply · undo</text>
+    <polyline points="627.0,266.0 627.0,358.0 162.0,358.0 162.0,424.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M162.0 424.0L157.8 414.0L166.2 414.0Z" fill="#58a6ff"/>
+    <polyline points="627.0,332.0 627.0,368.0 214.0,368.0 214.0,424.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M214.0 424.0L209.8 414.0L218.2 414.0Z" fill="#58a6ff"/>
+    <polyline points="262.0,476.0 302.0,476.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M302.0 476.0L292.0 480.2L292.0 471.8Z" fill="#58a6ff"/>
+    <polyline points="462.0,448.0 522.0,448.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M522.0 448.0L512.0 452.2L512.0 443.8Z" fill="#58a6ff"/>
+    <polyline points="462.0,520.0 522.0,520.0" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M522.0 520.0L512.0 524.2L512.0 515.8Z" fill="#58a6ff"/>
+    <rect x="62" y="676" width="240" height="68" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="182.0" y="704.2" text-anchor="middle" font-size="14.5" font-weight="700" fill="#e6edf3">security.py</text>
+    <text x="182.0" y="723.7" text-anchor="middle" font-size="11" fill="#8b949e">redaction · path containment</text>
+    <text x="182.0" y="738.7" text-anchor="middle" font-size="11" fill="#8b949e">atomic writes · hashing</text>
+    <rect x="360" y="676" width="200" height="68" rx="6" fill="#1a2129" stroke="#30363d"/>
+    <rect x="365" y="681" width="190" height="58" rx="4" fill="none" stroke="#30363d"/>
+    <text x="460.0" y="715.0" text-anchor="middle" font-size="13.5" fill="#e6edf3">Workspace AGENTS.md</text>
+    <polyline points="640.0,572.0 640.0,604.0 182.0,604.0 182.0,676.0" fill="none" stroke="#3fb950" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M182.0 676.0L177.8 666.0L186.2 666.0Z" fill="#3fb950"/>
+    <polyline points="302.0,710.0 360.0,710.0" fill="none" stroke="#3fb950" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M360.0 710.0L350.0 714.2L350.0 705.8Z" fill="#3fb950"/>
+    <path d="M300 813 A190.0 13 0 0 1 680 813 V883 A190.0 13 0 0 1 300 883 Z" fill="#1a2129" stroke="#30363d"/>
+    <path d="M300 813 A190.0 13 0 0 0 680 813" fill="none" stroke="#30363d"/>
+    <text x="490.0" y="843.0" text-anchor="middle" font-size="14" font-weight="700" fill="#e6edf3">SQLite store</text>
+    <text x="490.0" y="862.0" text-anchor="middle" font-size="11" fill="#8b949e">runs · findings · proposals</text>
+    <text x="490.0" y="877.0" text-anchor="middle" font-size="11" fill="#8b949e">approvals · patches</text>
+    <rect x="62" y="812" width="170" height="52" rx="9" fill="#1a2129" stroke="#30363d"/>
+    <text x="147.0" y="842.7" text-anchor="middle" font-size="13" font-weight="700" fill="#e6edf3">backups/</text>
+    <polyline points="162.0,528.0 162.0,584.0 620.0,584.0 620.0,800.0" fill="none" stroke="#e3b341" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+    <path d="M620.0 800.0L615.8 790.0L624.2 790.0Z" fill="#e3b341"/>
+    <polyline points="670.0,572.0 670.0,800.0" fill="none" stroke="#e3b341" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+    <path d="M670.0 800.0L665.8 790.0L674.2 790.0Z" fill="#e3b341"/>
+    <polyline points="250.0,744.0 250.0,838.0 232.0,838.0" fill="none" stroke="#3fb950" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M232.0 838.0L242.0 833.8L242.0 842.2Z" fill="#3fb950"/>
+    <polyline points="700.0,440.0 920.0,440.0 920.0,196.0 800.0,196.0 800.0,128.0" fill="none" stroke="#58a6ff" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+    <path d="M800.0 128.0L804.2 138.0L795.8 138.0Z" fill="#58a6ff"/>
+    <polyline points="920.0,196.0 387.0,196.0 387.0,128.0" fill="none" stroke="#58a6ff" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+    <path d="M387.0 128.0L391.2 138.0L382.8 138.0Z" fill="#58a6ff"/>
+    <polyline points="680.0,848.0 950.0,848.0 950.0,101.0 852.0,101.0" fill="none" stroke="#e3b341" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+    <path d="M852.0 101.0L862.0 96.8L862.0 105.2Z" fill="#e3b341"/>
+    <text x="724" y="468" text-anchor="start" font-size="11" fill="#8b949e">one code path</text>
+    <text x="724" y="484" text-anchor="start" font-size="11" fill="#8b949e">for both front ends</text>
+    <text x="712" y="432" text-anchor="start" font-size="10.5" fill="#58a6ff">reports + JSON views</text>
+    <text x="300" y="574" text-anchor="start" font-size="10.5" fill="#e3b341">run metadata</text>
+    <text x="680" y="692" text-anchor="start" font-size="10.5" fill="#e3b341">proposals</text>
+    <text x="690" y="838" text-anchor="start" font-size="10.5" fill="#e3b341">shared state</text>
+  </g>
+</svg>

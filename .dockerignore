@@ -1,0 +1,23 @@
+# Keep the build context to exactly what the wheel and the fixtures need.
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+.tracemend
+*.sqlite3
+*.bak
+.DS_Store
+.idea
+.vscode
+docs
+tests

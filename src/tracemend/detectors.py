@@ -11,8 +11,12 @@ Ownership rules (so the same wasted work is never reported twice)
   and search-like calls. It also leaves failing calls to ``TM002``: a repeated
   failure is a retry-discipline problem, not a general duplicate-call problem,
   and reporting it in both places would double-report the same waste.
-* ``TM003`` owns repeated reads of files that did not observably change.
-* ``TM004`` owns repeated and overlapping repository searches.
+* ``TM003`` owns repeated reads of the same file page that did not observably
+  change. Reads with explicitly different ``offset``/``limit``/``range`` values
+  are different pages and are legitimate; absent pagination lowers confidence
+  and unparseable or conflicting pagination is skipped.
+* ``TM004`` owns repeated and overlapping repository searches, including
+  re-searching after a relevant recorded change.
 * ``TM002`` owns repeated identical failures (retry discipline).
 * ``TM005`` is informational only: a hotspot is never automatically wasteful
   and is never marked ``fixable``.
@@ -31,10 +35,15 @@ Honesty rules
 * Duplicate work that spans several agents is reported with ``details["agents"]``
   and one confidence step lower, because a subagent may legitimately repeat a
   parent's call.
+* Only a write recorded as successful proves that a file changed. Failed writes
+  prove nothing, and writes with unknown outcomes are treated as possible
+  changes so a repeat is never asserted across them.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from collections.abc import Callable, Iterable, Sequence
 
 from .models import (
@@ -95,6 +104,9 @@ WRITE_TOOL_NAMES = frozenset(
 )
 PATH_ARG_KEYS = ("path", "file", "file_path", "filename", "notebook_path", "target")
 SCOPE_ARG_KEYS = ("path", "scope", "cwd", "directory", "dir", "root", "glob")
+#: Only the real pagination argument names; no invented ``line_start`` aliases.
+READ_RANGE_ARG_KEYS = ("offset", "limit", "range")
+_RANGE_PAIR_RE = re.compile(r"^\s*(\d+)\s*[-:]\s*(\d+)\s*$")
 
 _CONFIDENCE_STEPS: tuple[Confidence, ...] = ("low", "medium", "high")
 
@@ -159,6 +171,95 @@ def _normalize_pattern(pattern: str) -> str:
     return " ".join(pattern.split())
 
 
+def _range_int(value: object) -> int | None:
+    """Parse a non-negative integer page argument, or ``None`` when unclear."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _read_range(call: ToolCall) -> tuple[str, str | None]:
+    """Classify the page a read covered: ``(scheme, signature)``.
+
+    ``offset_limit`` and ``range`` are kept as distinct schemes: their
+    inclusive/exclusive semantics are not established, so a ``range`` pair is
+    never claimed to equal numerically similar ``offset``/``limit`` fields.
+    The signature retains every explicitly recorded field, so ``limit=20`` and
+    ``limit=50`` stay different pages. ``absent`` means no pagination was
+    recorded; ``unsupported`` covers malformed values and conflicting mixed
+    fields, which callers must not group as repeats.
+    """
+    arguments = call.arguments
+    has_offset = "offset" in arguments
+    has_limit = "limit" in arguments
+    has_range = "range" in arguments
+    if not (has_offset or has_limit or has_range):
+        return "absent", None
+    if has_range and (has_offset or has_limit):
+        return "unsupported", None
+    if has_offset or has_limit:
+        parts: list[str] = []
+        if has_offset:
+            offset = _range_int(arguments["offset"])
+            if offset is None:
+                return "unsupported", None
+            parts.append(f"offset={offset}")
+        if has_limit:
+            limit = _range_int(arguments["limit"])
+            if limit is None:
+                return "unsupported", None
+            parts.append(f"limit={limit}")
+        return "offset_limit", ";".join(parts)
+
+    raw = arguments["range"]
+    if isinstance(raw, str):
+        match = _RANGE_PAIR_RE.match(raw)
+        if not match:
+            return "unsupported", None
+        start, end = int(match.group(1)), int(match.group(2))
+    elif isinstance(raw, (list, tuple)) and len(raw) == 2:
+        start, end = _range_int(raw[0]), _range_int(raw[1])
+        if start is None or end is None:
+            return "unsupported", None
+    elif isinstance(raw, dict):
+        start, end = _range_int(raw.get("start")), _range_int(raw.get("end"))
+        if start is None or end is None:
+            return "unsupported", None
+    else:
+        return "unsupported", None
+    if end < start:
+        return "unsupported", None
+    return "range", f"range={start}:{end}"
+
+
+def _read_range_key(call: ToolCall) -> str:
+    """Group key for reads: one scheme and one page signature per group."""
+    status, signature = _read_range(call)
+    return f"{status}|{signature or ''}"
+
+
+def _path_within_scope(path: str, scope: str) -> bool:
+    """True only when a path is provably covered by a search scope."""
+    path_value = normalize_path(path)
+    scope_value = normalize_path(scope)
+    if not path_value:
+        return False
+    if scope_value in {"", "."}:
+        # No scope, or the repository root: every relative path is covered.
+        return True
+    if path_value == scope_value or path_value.startswith(scope_value + "/"):
+        return True
+    if any(char in scope_value for char in "*?["):
+        return fnmatch.fnmatchcase(path_value, scope_value)
+    return False
+
+
 def _ordered_groups(
     calls: Iterable[ToolCall], key_fn: Callable[[ToolCall], str]
 ) -> dict[str, list[ToolCall]]:
@@ -206,14 +307,32 @@ def sort_findings(findings: Iterable[Finding]) -> list[Finding]:
 # --------------------------------------------------------------------------- #
 # TM001 - duplicate tool calls
 # --------------------------------------------------------------------------- #
-def _touched_paths(call: ToolCall) -> set[str]:
-    """Paths a single call is known to have written."""
+def _declared_touched_paths(call: ToolCall) -> set[str]:
+    """Paths a call declares it wrote, regardless of the recorded outcome."""
     touched = {normalize_path(path) for path in call.modified_files if path}
     if is_write_call(call):
         target = path_of_call(call)
         if target:
             touched.add(normalize_path(target))
     return {path for path in touched if path}
+
+
+def _touched_paths(call: ToolCall) -> set[str]:
+    """Paths a call is known to have changed: successful writes only.
+
+    A failed write must not assert a file change, and a write with an unknown
+    outcome is not proof that anything changed.
+    """
+    if call.status != "success":
+        return set()
+    return _declared_touched_paths(call)
+
+
+def _possibly_touched_paths(call: ToolCall) -> set[str]:
+    """Paths a write may have changed; unknown outcomes remain possible changes."""
+    if call.status not in {"success", "unknown"}:
+        return set()
+    return _declared_touched_paths(call)
 
 
 def _group_candidate_paths(run: TraceRun, calls: Sequence[ToolCall]) -> set[str]:
@@ -245,15 +364,18 @@ def _mitigation_reason(run: TraceRun, calls: Sequence[ToolCall], paths: set[str]
     if not paths or is_write_call(calls[0]):
         return None
     positions = {event.id: index for index, event in enumerate(run.events)}
+    first_position = positions.get(calls[0].id)
     repeat_positions = [positions[call.id] for call in calls[1:] if call.id in positions]
-    if not repeat_positions:
+    if first_position is None or not repeat_positions:
         return None
     last_repeat = max(repeat_positions)
     for event in run.events:
-        if not is_write_call(event) or event.status == "error":
+        if not is_write_call(event) or event.status != "success":
             continue
         index = positions.get(event.id, len(run.events))
-        if index >= last_repeat:
+        # The edit has to land after the first call and before a later repeat;
+        # an edit before the whole group cannot justify the repeats.
+        if not first_position < index < last_repeat:
             continue
         hit = _touched_paths(event) & paths
         if not hit:
@@ -405,19 +527,22 @@ def detect_failed_retry_loops(run: TraceRun) -> list[Finding]:
 # TM003 - repeated file reads
 # --------------------------------------------------------------------------- #
 def detect_repeated_file_reads(run: TraceRun) -> list[Finding]:
-    """``TM003``: several reads of one file with no observable change in between."""
+    """``TM003``: several reads of one file page with no observable change in between."""
     modified_paths: set[str] = set()
-    run_has_modification_data = False
+    uncertain_paths: set[str] = set()
     for event in run.events:
-        touched = _touched_paths(event)
-        if touched:
-            run_has_modification_data = True
-            modified_paths |= touched
+        modified_paths |= _touched_paths(event)
+        if event.status == "unknown":
+            uncertain_paths |= _possibly_touched_paths(event)
+    run_has_modification_data = bool(modified_paths)
+    uncertain_paths -= modified_paths
 
     windows: dict[str, list[list[ToolCall]]] = {}
     current: dict[str, list[ToolCall]] = {}
     for event in run.events:
-        for path in _touched_paths(event):
+        # Successful writes prove a change; writes with unknown outcomes are
+        # treated as possible changes so a window never spans either.
+        for path in _possibly_touched_paths(event):
             if current.get(path):
                 windows.setdefault(path, []).append(current[path])
             current[path] = []
@@ -438,134 +563,232 @@ def detect_repeated_file_reads(run: TraceRun) -> list[Finding]:
         for window in path_windows:
             if len(window) < 2:
                 continue
-            redundant = len(window) - 1
-            severity, confidence = _severity_for_redundant(redundant)
-            if not run_has_modification_data:
-                confidence = "low"
-            elif not file_has_modification_data:
-                confidence = _lower_confidence(confidence)
-            tool = window[0].normalized_tool
-            details: dict[str, object] = {
-                "strategy": "file_read_reuse",
-                "path": path,
-                "reads_in_window": len(window),
-                "redundant_reads": redundant,
-                "modification_evidence": file_has_modification_data,
-                "run_has_modification_data": run_has_modification_data,
-            }
-            if not run_has_modification_data:
-                details["limitations"] = [
-                    "The trace contains no file-modification data at all, so it cannot be proven "
-                    "that the file content stayed the same between these reads; the file may have "
-                    "changed on disk and just not been recorded."
-                ]
-            elif not file_has_modification_data:
-                details["limitations"] = [
-                    f"The trace records no modification of {path} itself, so the file is treated "
-                    "as unchanged between these reads."
-                ]
-            key = f"{path}|{window[0].id}|{window[-1].id}|{len(window)}"
-            findings.append(
-                Finding(
-                    id=make_finding_id("TM003", tool, key),
-                    code="TM003",
-                    run_id=run.run_id,
-                    severity=severity,
-                    confidence=confidence,
-                    title=f"Repeated reads of {path} ({len(window)}x)",
-                    description=(
-                        f"{path} was read {len(window)} times with no modification in between, so "
-                        f"{redundant} of those reads repeated content that was already available. "
-                        "The first read is treated as legitimate."
-                    ),
-                    tool=tool,
-                    occurrences=len(window),
-                    evidence=_evidence(window[1:]),
-                    recommendation=(
-                        "Keep the file content from the first read in context instead of reading "
-                        f"{path} again; re-read only after something has changed it."
-                    ),
-                    fixable=True,
-                    details=details,
+            supported = [
+                call for call in window if _read_range(call)[0] != "unsupported"
+            ]
+            if len(supported) < 2:
+                continue
+            range_groups = _ordered_groups(supported, _read_range_key)
+            for range_key, reads in range_groups.items():
+                if len(reads) < 2:
+                    continue
+                range_status, signature = range_key.split("|", 1)
+                signature = signature or None
+                redundant = len(reads) - 1
+                severity, confidence = _severity_for_redundant(redundant)
+                if not run_has_modification_data:
+                    confidence = "low"
+                elif not file_has_modification_data:
+                    confidence = _lower_confidence(confidence)
+                if range_status == "absent":
+                    # Unknown page coverage cannot support a high-confidence repeat.
+                    confidence = _lower_confidence(confidence)
+                tool = reads[0].normalized_tool
+                details: dict[str, object] = {
+                    "strategy": "file_read_reuse",
+                    "path": path,
+                    "reads_in_window": len(reads),
+                    "redundant_reads": redundant,
+                    "read_range": signature,
+                    "range_status": range_status,
+                    "modification_evidence": file_has_modification_data,
+                    "run_has_modification_data": run_has_modification_data,
+                }
+                limitations: list[str] = []
+                if not run_has_modification_data:
+                    if uncertain_paths:
+                        limitations.append(
+                            "The trace contains no successful file-modification data, but writes "
+                            "with unknown outcomes were recorded and may have changed file content; "
+                            "repeated reads are reported with low confidence."
+                        )
+                    else:
+                        limitations.append(
+                            "The trace contains no file-modification data at all, so it cannot be "
+                            "proven that the file content stayed the same between these reads; the "
+                            "file may have changed on disk and just not been recorded."
+                        )
+                elif not file_has_modification_data:
+                    limitations.append(
+                        f"The trace records no modification of {path} itself, so the file is "
+                        "treated as unchanged between these reads."
+                    )
+                if range_status == "absent":
+                    limitations.append(
+                        f"No offset, limit or range was recorded for these reads of {path}, so the "
+                        "pages they covered cannot be compared; exact coverage is unknown."
+                    )
+                agents = _agent_ids(reads)
+                if len(agents) > 1:
+                    confidence = _lower_confidence(confidence)
+                    details["agents"] = agents
+                    details["mitigations"] = [
+                        "The repeated reads span several agents ("
+                        + ", ".join(agents)
+                        + "); a subagent may legitimately re-read a file its parent already read."
+                    ]
+                if limitations:
+                    details["limitations"] = limitations
+                if range_status == "absent" and len(range_groups) == 1:
+                    # Keep the historical id for runs without pagination data.
+                    key = f"{path}|{reads[0].id}|{reads[-1].id}|{len(reads)}"
+                else:
+                    key = (
+                        f"{path}|{range_key}|{reads[0].id}|{reads[-1].id}|{len(reads)}"
+                    )
+                if range_status == "absent":
+                    description = (
+                        f"{path} was read {len(reads)} times with no modification in between and "
+                        "no recorded offset, limit or range, so exact page overlap cannot be "
+                        f"confirmed; {redundant} of those reads may have repeated content that "
+                        "was already available. The first read is treated as legitimate."
+                    )
+                else:
+                    description = (
+                        f"{path} was read {len(reads)} times with no modification in between, "
+                        f"so {redundant} of those reads repeated content that was already "
+                        "available. The first read is treated as legitimate."
+                    )
+                findings.append(
+                    Finding(
+                        id=make_finding_id("TM003", tool, key),
+                        code="TM003",
+                        run_id=run.run_id,
+                        severity=severity,
+                        confidence=confidence,
+                        title=f"Repeated reads of {path} ({len(reads)}x)",
+                        description=description,
+                        tool=tool,
+                        occurrences=len(reads),
+                        evidence=_evidence(reads[1:]),
+                        recommendation=(
+                            "Keep the file content from the first read in context instead of "
+                            f"reading {path} again; re-read only after something has changed it."
+                        ),
+                        fixable=True,
+                        details=details,
+                    )
                 )
-            )
     return findings
 
 
 # --------------------------------------------------------------------------- #
 # TM004 - redundant search patterns
 # --------------------------------------------------------------------------- #
+def _relevant_write_positions(run: TraceRun, scope: str) -> list[int]:
+    """Positions in ``run.events`` of writes that may change a search scope."""
+    positions: list[int] = []
+    for index, event in enumerate(run.events):
+        touched = _possibly_touched_paths(event)
+        if touched and any(_path_within_scope(path, scope) for path in touched):
+            positions.append(index)
+    return positions
+
+
+def _search_windows(
+    calls: Sequence[ToolCall], boundaries: Sequence[int], positions: dict[str, int]
+) -> list[list[ToolCall]]:
+    """Split a group at relevant writes so re-searching changed content is allowed."""
+    windows: list[list[ToolCall]] = []
+    current: list[ToolCall] = [calls[0]]
+    for call in calls[1:]:
+        start = positions[current[-1].id]
+        end = positions[call.id]
+        if any(start < boundary < end for boundary in boundaries):
+            windows.append(current)
+            current = [call]
+        else:
+            current.append(call)
+    windows.append(current)
+    return windows
+
+
 def detect_redundant_searches(run: TraceRun) -> list[Finding]:
     """``TM004``: identical searches, and broad searches covered by narrower ones."""
-    searches = [call for call in run.events if is_search_call(call)]
+    # Failed searches are retry discipline: TM002 owns them, TM004 must not
+    # report the same error calls as wasted search work.
+    searches = [
+        call for call in run.events if is_search_call(call) and call.status != "error"
+    ]
     if not searches:
         return []
 
+    positions = {call.id: index for index, call in enumerate(run.events)}
     findings: list[Finding] = []
     claimed: set[str] = set()
 
     for fingerprint, calls in _ordered_groups(searches, lambda call: call.call_fingerprint).items():
         if len(calls) < 2:
             continue
-        redundant = len(calls) - 1
-        severity, confidence = _severity_for_redundant(redundant)
-        fingerprints = [call.result_fingerprint for call in calls]
-        details: dict[str, object] = {
-            "strategy": "search_efficiency",
-            "call_fingerprint": fingerprint,
-            "matched_ids": [call.id for call in calls],
-            "result_fingerprints": sorted({fp for fp in fingerprints if fp}),
-            "redundant_searches": redundant,
-        }
-        if all(fp is not None for fp in fingerprints) and len(set(fingerprints)) == 1:
-            # The strongest evidence available: identical arguments *and* identical results.
-            confidence = "high"
-            details["identical_results"] = True
-        else:
-            confidence = _lower_confidence(confidence)
-            details["identical_results"] = None
-            details["limitations"] = [
-                "Result fingerprints are missing or differ between these calls, so identical "
-                "results cannot be confirmed; only the repeated arguments are known."
-            ]
-        agent_ids = _agent_ids(calls)
-        if len(agent_ids) > 1:
-            confidence = _lower_confidence(confidence)
-            details["agents"] = agent_ids
-            details.setdefault("mitigations", []).append(
-                "The repeated search spans several agents ("
-                + ", ".join(agent_ids)
-                + "); a subagent may legitimately repeat a parent agent's search."
-            )
-        pattern = search_pattern_of(calls[0]) or ""
-        scope = search_scope_of(calls[0])
-        tool = calls[0].normalized_tool
-        key = f"{fingerprint}|{len(calls)}"
         claimed.update(call.id for call in calls)
-        findings.append(
-            Finding(
-                id=make_finding_id("TM004", tool, key),
-                code="TM004",
-                run_id=run.run_id,
-                severity=severity,
-                confidence=confidence,
-                title=f"Repeated search ({len(calls)}x): {pattern!r} in {scope or '.'}",
-                description=(
-                    f"The search {pattern!r} over {scope or '.'} was issued {len(calls)} times "
-                    f"with identical arguments, so {redundant} of those searches repeated the same "
-                    "lookup. The first search is treated as legitimate."
-                ),
-                tool=tool,
-                occurrences=len(calls),
-                evidence=_evidence(calls[1:]),
-                recommendation=(
-                    "Reuse the results of the earlier search instead of issuing an identical one; "
-                    "search again only when the searched content has changed."
-                ),
-                fixable=True,
-                details=details,
+        # A successful (or unknown-outcome) write that may have changed the
+        # searched content legitimizes searching again after it.
+        scope = search_scope_of(calls[0])
+        boundaries = _relevant_write_positions(run, scope)
+        windows = _search_windows(calls, boundaries, positions)
+        for window in windows:
+            if len(window) < 2:
+                continue
+            redundant = len(window) - 1
+            severity, confidence = _severity_for_redundant(redundant)
+            fingerprints = [call.result_fingerprint for call in window]
+            details: dict[str, object] = {
+                "strategy": "search_efficiency",
+                "call_fingerprint": fingerprint,
+                "matched_ids": [call.id for call in window],
+                "result_fingerprints": sorted({fp for fp in fingerprints if fp}),
+                "redundant_searches": redundant,
+            }
+            if all(fp is not None for fp in fingerprints) and len(set(fingerprints)) == 1:
+                # The strongest evidence available: identical arguments *and* identical results.
+                confidence = "high"
+                details["identical_results"] = True
+            else:
+                confidence = _lower_confidence(confidence)
+                details["identical_results"] = None
+                details["limitations"] = [
+                    "Result fingerprints are missing or differ between these calls, so identical "
+                    "results cannot be confirmed; only the repeated arguments are known."
+                ]
+            agent_ids = _agent_ids(window)
+            if len(agent_ids) > 1:
+                confidence = _lower_confidence(confidence)
+                details["agents"] = agent_ids
+                details.setdefault("mitigations", []).append(
+                    "The repeated search spans several agents ("
+                    + ", ".join(agent_ids)
+                    + "); a subagent may legitimately repeat a parent agent's search."
+                )
+            pattern = search_pattern_of(window[0]) or ""
+            tool = window[0].normalized_tool
+            if len(windows) == 1:
+                key = f"{fingerprint}|{len(window)}"
+            else:
+                key = f"{fingerprint}|{window[0].id}|{window[-1].id}|{len(window)}"
+            findings.append(
+                Finding(
+                    id=make_finding_id("TM004", tool, key),
+                    code="TM004",
+                    run_id=run.run_id,
+                    severity=severity,
+                    confidence=confidence,
+                    title=f"Repeated search ({len(window)}x): {pattern!r} in {scope or '.'}",
+                    description=(
+                        f"The search {pattern!r} over {scope or '.'} was issued {len(window)} times "
+                        f"with identical arguments, so {redundant} of those searches repeated the "
+                        "same lookup. The first search is treated as legitimate."
+                    ),
+                    tool=tool,
+                    occurrences=len(window),
+                    evidence=_evidence(window[1:]),
+                    recommendation=(
+                        "Reuse the results of the earlier search instead of issuing an identical "
+                        "one; search again only when the searched content has changed."
+                    ),
+                    fixable=True,
+                    details=details,
+                )
             )
-        )
 
     findings.extend(_detect_broad_search_covered_by_narrower(run, searches, claimed))
     return findings
@@ -576,14 +799,25 @@ def _detect_broad_search_covered_by_narrower(
 ) -> list[Finding]:
     """A broad pattern whose results are already covered by a narrower pattern."""
     findings: list[Finding] = []
+    positions = {call.id: index for index, call in enumerate(run.events)}
     for broader in searches:
         broad_pattern = search_pattern_of(broader)
         if not broad_pattern:
             continue
         broad_scope = search_scope_of(broader)
         norm_broad = _normalize_pattern(broad_pattern)
+        boundaries = _relevant_write_positions(run, broad_scope)
         for narrower in searches:
             if narrower.id == broader.id or narrower.normalized_tool != broader.normalized_tool:
+                continue
+            # Only an earlier narrower search can have covered a later broad
+            # search; a later narrow result cannot justify work already done.
+            narrow_position = positions[narrower.id]
+            broad_position = positions[broader.id]
+            if narrow_position >= broad_position:
+                continue
+            if any(narrow_position < boundary < broad_position for boundary in boundaries):
+                # A relevant recorded change justifies searching again.
                 continue
             narrow_pattern = search_pattern_of(narrower)
             if not narrow_pattern:
@@ -614,6 +848,16 @@ def _detect_broad_search_covered_by_narrower(
                 "identical_results": True,
                 "redundant_searches": 1,
             }
+            confidence: Confidence = "high"
+            agent_ids = _agent_ids([broader, narrower])
+            if len(agent_ids) > 1:
+                confidence = _lower_confidence(confidence)
+                details["agents"] = agent_ids
+                details["mitigations"] = [
+                    "The coverage relies on searches from several agents ("
+                    + ", ".join(agent_ids)
+                    + "); a subagent may legitimately repeat a parent agent's search."
+                ]
             if broader.id in claimed:
                 continue
             claimed.add(broader.id)
@@ -623,7 +867,7 @@ def _detect_broad_search_covered_by_narrower(
                     code="TM004",
                     run_id=run.run_id,
                     severity="low",
-                    confidence="high",
+                    confidence=confidence,
                     title=f"Broad search {broad_pattern!r} already covered by {narrow_pattern!r}",
                     description=(
                         f"The search {broad_pattern!r} over {broad_scope or '.'} returned the same "
@@ -653,12 +897,18 @@ def detect_tool_hotspots(run: TraceRun) -> list[Finding]:
         return []
     known_durations = [event.duration_ms for event in run.events if event.duration_ms is not None]
     total_duration = sum(known_durations) if known_durations else None
-    durations_available = bool(known_durations)
-    tokens_available = any(
-        event.token_usage is not None and event.token_usage.total is not None for event in run.events
-    )
-    costs_available = any(event.cost is not None for event in run.events)
     total_calls = len(run.events)
+    duration_known = len(known_durations)
+    token_known = sum(
+        1
+        for event in run.events
+        if event.token_usage is not None and event.token_usage.total is not None
+    )
+    cost_known = sum(1 for event in run.events if event.cost is not None)
+    outcome_known = sum(1 for event in run.events if event.status != "unknown")
+    durations_available = duration_known > 0
+    tokens_available = token_known > 0
+    costs_available = cost_known > 0
 
     findings: list[Finding] = []
     for tool, calls in _ordered_groups(run.events, lambda call: call.normalized_tool).items():
@@ -669,13 +919,17 @@ def detect_tool_hotspots(run: TraceRun) -> list[Finding]:
         share: float | None = None
         if durations_available and total_duration and tool_duration is not None:
             share = tool_duration / total_duration
-        is_hotspot = (
-            call_count >= HOTSPOT_MIN_CALLS
-            or failures >= HOTSPOT_MIN_FAILURES
-            or (share is not None and share + 1e-9 >= HOTSPOT_MIN_DURATION_SHARE)
-        )
-        if not is_hotspot:
+        call_trigger = call_count >= HOTSPOT_MIN_CALLS
+        failure_trigger = failures >= HOTSPOT_MIN_FAILURES
+        duration_trigger = share is not None and share + 1e-9 >= HOTSPOT_MIN_DURATION_SHARE
+        if not (call_trigger or failure_trigger or duration_trigger):
             continue
+        confidence: Confidence = "medium"
+        if duration_trigger and not call_trigger and not failure_trigger and duration_known < total_calls:
+            # A duration share computed from a subset cannot prove a hotspot.
+            confidence = "low"
+        if failure_trigger and not call_trigger and outcome_known < total_calls:
+            confidence = _lower_confidence(confidence)
         tokens = [
             call.token_usage.total
             for call in calls
@@ -691,6 +945,13 @@ def detect_tool_hotspots(run: TraceRun) -> list[Finding]:
             "share_of_observed_duration": round(share, 4) if share is not None else None,
             "tokens": sum(tokens) if tokens else None,
             "cost": sum(costs) if costs else None,
+            "measurement_coverage": {
+                "calls": total_calls,
+                "durations_recorded": duration_known,
+                "tokens_recorded": token_known,
+                "costs_recorded": cost_known,
+                "outcomes_recorded": outcome_known,
+            },
             "informational_only": True,
         }
         limitations: list[str] = []
@@ -699,14 +960,34 @@ def detect_tool_hotspots(run: TraceRun) -> list[Finding]:
                 "Token usage was not present anywhere in this trace, so no token figures are "
                 "reported for this tool."
             )
+        elif token_known < total_calls:
+            limitations.append(
+                f"Token usage was recorded for only {token_known}/{total_calls} calls; the "
+                "reported token sum is partial."
+            )
         if not costs_available:
             limitations.append(
                 "Cost was not present anywhere in this trace, so no cost figures are reported."
+            )
+        elif cost_known < total_calls:
+            limitations.append(
+                f"Cost was recorded for only {cost_known}/{total_calls} calls; the reported cost "
+                "sum is partial."
             )
         if not durations_available:
             limitations.append(
                 "No durations were recorded in this trace, so this tool's share of tool time is "
                 "unavailable."
+            )
+        elif duration_known < total_calls:
+            limitations.append(
+                f"Duration was recorded for only {duration_known}/{total_calls} calls; the "
+                "observed-time share is based on recorded durations only."
+            )
+        if outcome_known < total_calls:
+            limitations.append(
+                f"Outcomes are unknown for {total_calls - outcome_known}/{total_calls} calls; the "
+                "failure count includes only recorded errors and may undercount failures."
             )
         if limitations:
             details["limitations"] = limitations
@@ -716,7 +997,7 @@ def detect_tool_hotspots(run: TraceRun) -> list[Finding]:
                 code="TM005",
                 run_id=run.run_id,
                 severity="info",
-                confidence="medium",
+                confidence=confidence,
                 title=f"Tool hotspot: {tool}",
                 description=(
                     f"{tool} accounted for {call_count} of {total_calls} observed calls"

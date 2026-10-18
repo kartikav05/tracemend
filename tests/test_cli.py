@@ -129,7 +129,7 @@ class CliTestCase(unittest.TestCase):
         self.assertRegex(result.output, r"Total tool calls\s+29")
         self.assertRegex(result.output, r"Failed calls\s+4")
         self.assertRegex(result.output, r"Duplicate calls\s+21")
-        self.assertRegex(result.output, r"Potential inefficiencies\s+10")
+        self.assertRegex(result.output, r"Potential inefficiencies\s+11")
 
     def test_analyze_json_is_the_only_stdout_contract(self) -> None:
         result = self.invoke("analyze", str(TRACE_FIXTURE), "--format", "json")
@@ -140,7 +140,16 @@ class CliTestCase(unittest.TestCase):
         self.assertTrue(result.stdout.strip().startswith("{"))
         self.assertTrue(result.stdout.strip().endswith("}"))
         self.assertIsInstance(payload, dict)
-        self.assertEqual(len(payload["findings"]), 10)
+        self.assertEqual(len(payload["findings"]), 11)
+        # The successful call_015 edit makes the next payment_status search
+        # legitimate; only repeats within each side of that edit are cited.
+        search_evidence = [
+            finding["evidence"] for finding in payload["findings"]
+            if finding["code"] == "TM004"
+        ]
+        self.assertIn(["call_002", "call_008"], search_evidence)
+        self.assertIn(["call_022"], search_evidence)
+        self.assertFalse(any("call_018" in evidence for evidence in search_evidence))
         self.assertTrue(str(payload["run_id"]).startswith("run_"))
 
     def test_analyze_output_writes_report_file(self) -> None:
@@ -149,7 +158,7 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertTrue(report_path.is_file())
         payload = json.loads(report_path.read_text(encoding="utf-8"))
-        self.assertEqual(len(payload["findings"]), 10)
+        self.assertEqual(len(payload["findings"]), 11)
 
     def test_analyze_missing_trace_fails_cleanly(self) -> None:
         missing = self.workspace / "does_not_exist.json"

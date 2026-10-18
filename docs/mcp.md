@@ -31,6 +31,7 @@ Server command: `tracemend mcp` (the `mcp` subcommand in `src/tracemend/cli.py`,
 | `submit_ai_fix_proposal` | `run_id`, `finding_id`, `workspace`, `proposed_instruction` | Propose (stores model text as a PENDING proposal; can never apply) | Accept model-authored instruction text as a pending proposal for human review |
 
 Optional arguments (source of truth, not exhaustive here): `load_trace` accepts `format`; `get_findings` accepts `severity` and `limit`; `inspect_tool_calls` accepts `call_ids` and `limit`; `propose_fix` and `submit_ai_fix_proposal` accept `target_file` (default `AGENTS.md`).
+The `format` argument (and the CLI's `--source-format`) accepts `generic` and `opencode` today, with native `claude-code` and `cursor` planned; `load_trace` auto-detects when `format` is omitted. See [setup.md](./setup.md) for what those formats accept and their caveats.
 Note that `analyze_trace` is listed as a read-only tool in the server's module docstring and as a local-write tool in the same docstring; the precise behaviour is that it reads your workspace and writes only to TraceMend's own store.
 
 `submit_ai_fix_proposal` treats model-written text as untrusted: it length-checks it, strips control characters, blocks fenced code blocks, restricts the target to a project-local `AGENTS.md`, and can only ever create a `pending` proposal.

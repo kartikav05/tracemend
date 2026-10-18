@@ -99,6 +99,10 @@ Adapters normalise a vendor export into the shared Pydantic models in `src/trace
 
 1. **Start from the existing adapters.** Follow `src/tracemend/adapters/generic.py`
    (`parse_generic`) and `src/tracemend/adapters/opencode.py` (`parse_opencode`).
+   For JSON Lines / NDJSON sources (such as the planned native Claude Code and
+   Cursor adapters), reuse the shared bounded reader in
+   `src/tracemend/adapters/jsonl.py` (`parse_jsonl`, `as_rows`, `single_session_id`)
+   instead of writing line parsing by hand.
 2. **Normalise into the shared models.** Produce `ToolCall` and `TraceRun` objects.
    Reuse the coercion helpers in `generic.py` — `first_present`, `coerce_text`,
    `coerce_int`, `coerce_float`, `timestamp_from_time`, `duration_from_time`,

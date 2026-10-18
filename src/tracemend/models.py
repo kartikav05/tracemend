@@ -23,6 +23,9 @@ RunSource = Literal["generic", "opencode", "claude-code", "cursor"]
 ProposalStatus = Literal["pending", "approved", "rejected", "applied", "undone", "stale"]
 PatchStatus = Literal["applied", "undone"]
 ProposalOrigin = Literal["deterministic", "ai"]
+#: Durable write-ahead journal states; ``PatchRecord.status`` stays ``applied|undone``.
+OperationKind = Literal["apply", "undo"]
+OperationStatus = Literal["intent", "committed", "aborted", "needs_review"]
 
 #: Detector codes -> human readable category title.
 FINDING_CODES: dict[str, str] = {
@@ -448,6 +451,9 @@ class ApprovalRecord(BaseModel):
     approved_at: datetime = Field(default_factory=utc_now)
     approved_by: str = "local-cli"
     status: str = "granted"
+    #: Whether AGENTS.md existed when the proposal was built. ``None`` means a
+    #: legacy record that could not distinguish a missing file from an empty one.
+    original_existed: bool | None = None
 
 
 class FixProposal(BaseModel):
@@ -478,6 +484,8 @@ class FixProposal(BaseModel):
     applied_sha256: str | None = None
     patch_id: str | None = None
     approval_id: str | None = None
+    #: Pre-apply existence of the target; ``None`` for legacy proposals.
+    original_existed: bool | None = None
 
     @property
     def patch_sha256(self) -> str:
@@ -505,6 +513,39 @@ class PatchRecord(BaseModel):
     backup_path: str
     status: PatchStatus = "applied"
     undone_at: datetime | None = None
+    #: Whether the target existed before the patch; ``None`` for legacy patches.
+    original_existed: bool | None = None
+
+
+class FixOperation(BaseModel):
+    """A durable write-ahead intent for one apply or undo.
+
+    The intent row is committed before the filesystem is touched so recovery can
+    classify an interrupted operation by observed existence and hash alone.
+    ``expected_sha256`` is the hash the target must have once the operation has
+    landed; for ``undo`` of a missing original the target must instead be absent
+    (``original_existed is False``).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    operation_id: str
+    kind: OperationKind
+    proposal_id: str
+    patch_id: str
+    run_id: str
+    workspace: str
+    target_file: str
+    backup_path: str
+    original_sha256: str
+    original_existed: bool | None = None
+    expected_sha256: str
+    #: Hash of the target just before an ``undo`` (``None`` for ``apply``).
+    applied_sha256: str | None = None
+    status: OperationStatus = "intent"
+    detail: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class MetricDelta(BaseModel):

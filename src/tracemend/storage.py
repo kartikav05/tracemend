@@ -17,19 +17,23 @@ from pathlib import Path
 from .errors import (
     FindingNotFoundError,
     PatchNotFoundError,
+    ProposalConflictError,
     ProposalNotFoundError,
     RunNotFoundError,
+    TraceMendError,
 )
 from .models import (
     AnalysisReport,
     ApprovalRecord,
     Finding,
+    FixOperation,
     FixProposal,
     PatchRecord,
     TraceRun,
+    utc_now,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DATA_DIR_ENV = "TRACEMEND_DATA_DIR"
 DB_FILENAME = "tracemend.sqlite3"
 
@@ -105,6 +109,23 @@ CREATE TABLE IF NOT EXISTS patches (
 );
 
 CREATE INDEX IF NOT EXISTS idx_patches_proposal ON patches(proposal_id);
+
+-- Write-ahead journal added in schema v2. Additive only: no existing table is
+-- rewritten and legacy payloads keep validating through optional fields.
+CREATE TABLE IF NOT EXISTS fix_operations (
+    operation_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    patch_id TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fix_operations_proposal
+    ON fix_operations(proposal_id, kind, status);
+CREATE INDEX IF NOT EXISTS idx_fix_operations_status ON fix_operations(status);
 """
 
 
@@ -144,11 +165,14 @@ class Store:
         return cls(default_data_dir())
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=10.0)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA foreign_keys = ON")
+            if immediate:
+                # Serialise journal intent and finalisation with other writers.
+                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except BaseException:
@@ -159,12 +183,39 @@ class Store:
 
     def _initialise(self) -> None:
         with self._connect() as connection:
+            version = self._schema_version(connection)
+            if version > SCHEMA_VERSION:
+                raise TraceMendError(
+                    f"database schema v{version} is newer than this TraceMend "
+                    f"(v{SCHEMA_VERSION})",
+                    hint="Upgrade TraceMend instead of downgrading the database.",
+                )
             self._drop_legacy_tables(connection)
             connection.executescript(_SCHEMA)
             connection.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+                (str(max(version, SCHEMA_VERSION)),),
             )
+
+    @staticmethod
+    def _schema_version(connection: sqlite3.Connection) -> int:
+        """Read the stored version before any migration runs (0 when absent)."""
+        try:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # A brand-new database has no ``meta`` table yet.
+            return 0
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise TraceMendError(
+                f"unreadable database schema version: {row['value']!r}",
+                hint="Move the data directory aside and recreate it.",
+            ) from exc
 
     @staticmethod
     def _drop_legacy_tables(connection: sqlite3.Connection) -> None:
@@ -405,21 +456,44 @@ class Store:
         return [FixProposal.model_validate_json(row["payload"]) for row in rows]
 
     def find_proposal_for(
-        self, run_id: str, finding_id: str, target_file: str, strategy: str
+        self,
+        run_id: str,
+        finding_id: str,
+        target_file: str,
+        strategy: str,
+        *,
+        workspace: str | None = None,
+        original_sha256: str | None = None,
+        original_existed: bool | None = None,
     ) -> FixProposal | None:
-        """Idempotency lookup so the same fix is never proposed twice."""
+        """Idempotency lookup for a still-active proposal in the same workspace.
+
+        Only ``pending``/``approved`` proposals are reused: an applied, undone,
+        stale or rejected proposal must never be re-applied without a fresh
+        approval. The lookup also requires the same canonical workspace and the
+        same observed original state, so a missing file is never confused with
+        an existing empty one or with another checkout.
+        """
+        query = """
+            SELECT payload FROM proposals
+            WHERE run_id = ? AND finding_id = ? AND target_file = ? AND strategy = ?
+              AND status IN ('pending', 'approved')
+        """
+        params: list[object] = [run_id, finding_id, target_file, strategy]
+        if workspace is not None:
+            query += " AND workspace = ?"
+            params.append(workspace)
+        query += " ORDER BY created_at DESC"
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT payload FROM proposals
-                WHERE run_id = ? AND finding_id = ? AND target_file = ? AND strategy = ?
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (run_id, finding_id, target_file, strategy),
-            ).fetchone()
-        if row is None:
-            return None
-        return FixProposal.model_validate_json(row["payload"])
+            rows = connection.execute(query, params).fetchall()
+        for row in rows:
+            proposal = FixProposal.model_validate_json(row["payload"])
+            if original_sha256 is not None and proposal.original_sha256 != original_sha256:
+                continue
+            if original_existed is not None and proposal.original_existed != original_existed:
+                continue
+            return proposal
+        return None
 
     # -------------------------------------------------------------- approvals
     def save_approval(self, record: ApprovalRecord) -> ApprovalRecord:
@@ -503,3 +577,225 @@ class Store:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [PatchRecord.model_validate_json(row["payload"]) for row in rows]
+
+    # ------------------------------------------------------------- operations
+    def begin_operation(self, operation: FixOperation) -> FixOperation:
+        """Commit one write-ahead intent before the filesystem is touched.
+
+        ``BEGIN IMMEDIATE`` plus the duplicate checks make the "one live
+        operation and at most one applied patch per proposal" invariant hold
+        across cooperating stores/processes.
+        """
+        with self._connect(immediate=True) as connection:
+            live = connection.execute(
+                """
+                SELECT operation_id FROM fix_operations
+                WHERE proposal_id = ? AND kind = ? AND status = 'intent'
+                """,
+                (operation.proposal_id, operation.kind),
+            ).fetchone()
+            if live is not None:
+                raise ProposalConflictError(
+                    f"proposal {operation.proposal_id} already has an unfinished "
+                    f"{operation.kind}",
+                    hint="Re-run the command to recover it, or inspect "
+                    "`tracemend fix list`.",
+                )
+            if operation.kind == "apply":
+                applied = connection.execute(
+                    "SELECT COUNT(*) AS n FROM patches WHERE proposal_id = ? "
+                    "AND status = 'applied'",
+                    (operation.proposal_id,),
+                ).fetchone()["n"]
+                if applied:
+                    raise ProposalConflictError(
+                        f"proposal {operation.proposal_id} already has an applied patch",
+                        hint="Undo the existing patch before applying again.",
+                    )
+            connection.execute(
+                """
+                INSERT INTO fix_operations(
+                    operation_id, kind, proposal_id, patch_id, workspace, status,
+                    created_at, payload
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation.operation_id,
+                    operation.kind,
+                    operation.proposal_id,
+                    operation.patch_id,
+                    operation.workspace,
+                    operation.status,
+                    operation.created_at.isoformat(),
+                    operation.model_dump_json(),
+                ),
+            )
+        return operation
+
+    def get_operation(self, operation_id: str) -> FixOperation:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM fix_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            raise PatchNotFoundError(f"operation not found: {operation_id}")
+        return FixOperation.model_validate_json(row["payload"])
+
+    def list_operations(
+        self,
+        *,
+        status: str | None = None,
+        proposal_id: str | None = None,
+        patch_id: str | None = None,
+    ) -> list[FixOperation]:
+        query = "SELECT payload FROM fix_operations"
+        clauses: list[str] = []
+        params: list[object] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if proposal_id:
+            clauses.append("proposal_id = ?")
+            params.append(proposal_id)
+        if patch_id:
+            clauses.append("patch_id = ?")
+            params.append(patch_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [FixOperation.model_validate_json(row["payload"]) for row in rows]
+
+    def list_live_operations(
+        self, *, proposal_id: str | None = None, patch_id: str | None = None
+    ) -> list[FixOperation]:
+        operations = self.list_operations(status="intent", proposal_id=proposal_id)
+        if patch_id is not None:
+            operations = [op for op in operations if op.patch_id == patch_id]
+        return operations
+
+    def finish_operation(
+        self,
+        operation: FixOperation,
+        *,
+        status: str,
+        patch: PatchRecord | None = None,
+        proposal: FixProposal | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Finalise journal, patch and proposal in one transaction.
+
+        The guarded ``status = 'intent'`` update makes finalisation
+        idempotent: a crash after the filesystem write but before this commit
+        is recovered by re-running it, while a concurrent writer cannot
+        double-apply an operation.
+        """
+        with self._connect(immediate=True) as connection:
+            current_row = connection.execute(
+                "SELECT status FROM fix_operations WHERE operation_id = ?",
+                (operation.operation_id,),
+            ).fetchone()
+            if current_row is None:
+                raise PatchNotFoundError(f"operation not found: {operation.operation_id}")
+            if current_row["status"] != "intent":
+                if current_row["status"] == status:
+                    return
+                raise ProposalConflictError(
+                    f"operation {operation.operation_id} is {current_row['status']}, "
+                    "not intent",
+                    hint="Re-run the command to recover the interrupted operation.",
+                )
+            operation.status = status  # type: ignore[assignment]
+            operation.detail = detail
+            operation.updated_at = utc_now()
+            connection.execute(
+                """
+                UPDATE fix_operations SET status = ?, payload = ?
+                WHERE operation_id = ? AND status = 'intent'
+                """,
+                (status, operation.model_dump_json(), operation.operation_id),
+            )
+            if patch is not None:
+                self._write_patch(connection, patch)
+            if proposal is not None:
+                self._write_proposal(
+                    connection, proposal, patch_status=patch.status if patch else ""
+                )
+
+    @staticmethod
+    def _write_patch(connection: sqlite3.Connection, record: PatchRecord) -> None:
+        connection.execute(
+            """
+            INSERT INTO patches(patch_id, proposal_id, run_id, status, applied_at, payload)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(patch_id) DO UPDATE SET
+                status=excluded.status,
+                payload=excluded.payload
+            """,
+            (
+                record.patch_id,
+                record.proposal_id,
+                record.run_id,
+                record.status,
+                record.applied_at.isoformat(),
+                record.model_dump_json(),
+            ),
+        )
+
+    @staticmethod
+    def _write_proposal(
+        connection: sqlite3.Connection,
+        proposal: FixProposal,
+        *,
+        patch_status: str,
+    ) -> None:
+        existing = connection.execute(
+            "SELECT status FROM proposals WHERE proposal_id = ?",
+            (proposal.proposal_id,),
+        ).fetchone()
+        if existing is not None:
+            current = existing["status"]
+            if patch_status == "undone":
+                if current not in {"applied", "undone"}:
+                    raise ProposalConflictError(
+                        f"proposal {proposal.proposal_id} is {current}, not applied",
+                        hint="Reload the proposal before retrying.",
+                    )
+            elif current in {"applied", "undone"}:
+                raise ProposalConflictError(
+                    f"proposal {proposal.proposal_id} is already {current}",
+                    hint="Reload the proposal before retrying.",
+                )
+        connection.execute(
+            """
+            INSERT INTO proposals(
+                proposal_id, run_id, finding_id, strategy, target_file,
+                workspace, status, created_at, payload
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(proposal_id) DO UPDATE SET
+                status=excluded.status,
+                payload=excluded.payload
+            """,
+            (
+                proposal.proposal_id,
+                proposal.run_id,
+                proposal.finding_id,
+                proposal.strategy,
+                proposal.target_file,
+                proposal.workspace,
+                proposal.status,
+                proposal.created_at.isoformat(),
+                proposal.model_dump_json(),
+            ),
+        )
+
+    def applied_patch_count(self, proposal_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS n FROM patches WHERE proposal_id = ? "
+                "AND status = 'applied'",
+                (proposal_id,),
+            ).fetchone()
+        return int(row["n"])

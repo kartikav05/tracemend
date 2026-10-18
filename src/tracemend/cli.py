@@ -247,7 +247,7 @@ def fix_diff(ctx: click.Context, proposal_id: str, output_format: str) -> None:
 
     if as_json:
         payload = reports.proposal_to_payload(proposal)
-        payload["diff"] = proposal.patch
+        payload["diff"] = reports.sanitize(proposal.patch)
         click.echo(reports.to_json_text(payload))
         return
     console.print(reports.build_diff_view(proposal))

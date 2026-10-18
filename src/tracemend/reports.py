@@ -4,7 +4,8 @@ Built for humans first (Rich), with a plain-text fallback used by
 machine-readable and non-interactive modes. Nothing in this module writes to
 disk or mutates state. Every human-readable string is passed through
 ``security.redact_text`` so trace evidence can never leak a secret into a
-terminal, a report file or an AI client.
+terminal, a report file or an AI client. The ``*_to_payload`` helpers are the
+only supported way to build outbound JSON, and they redact the same way.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .models import (
     RunMetrics,
     TraceRun,
 )
-from .security import limit_preview, redact_text
+from .security import limit_preview, redact_text, redact_value
 
 BRAND = "TraceMend"
 TAGLINE = "Find the waste. Fix the agent."
@@ -446,17 +447,42 @@ def to_json_text(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=False, default=str)
 
 
+def _redact_public(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact every string in an outbound payload, recording which patterns fired."""
+    cleaned, hits = redact_value(payload)
+    if hits:
+        cleaned["redactions"] = hits
+    return cleaned
+
+
 def report_to_payload(report: AnalysisReport) -> dict[str, Any]:
-    return json.loads(report.model_dump_json())
+    return _redact_public(json.loads(report.model_dump_json()))
 
 
-def finding_to_payload(finding: Finding) -> dict[str, Any]:
-    return json.loads(finding.model_dump_json())
+def finding_to_payload(finding: Finding, *, public: bool = True) -> dict[str, Any]:
+    """Outbound finding payload. Redacted unless ``public`` is false."""
+    payload = json.loads(finding.model_dump_json())
+    return _redact_public(payload) if public else payload
 
 
-def proposal_to_payload(proposal: FixProposal) -> dict[str, Any]:
+def proposal_to_payload(proposal: FixProposal, *, public: bool = True) -> dict[str, Any]:
+    """Outbound proposal payload.
+
+    ``original_content`` — the workspace file exactly as it was before the
+    proposed change — never leaves the process. It is internal state, and it is
+    what leaked a workspace credential into MCP responses, because imported-trace
+    redaction cannot reach a file that lives in the user's workspace.
+
+    When ``public`` is true the remaining text is redacted too. ``patch_sha256``
+    is always computed from the exact internal patch, so a stored approval stays
+    bound to the bytes that would actually be written.
+    """
     payload = json.loads(proposal.model_dump_json())
-    payload["patch_sha256"] = proposal.patch_sha256
+    payload.pop("original_content", None)
+    patch_sha256 = proposal.patch_sha256
+    if public:
+        payload = _redact_public(payload)
+    payload["patch_sha256"] = patch_sha256
     return payload
 
 
@@ -465,15 +491,15 @@ def run_to_payload(run: TraceRun, *, include_events: bool = False) -> dict[str, 
     if not include_events:
         payload.pop("events", None)
         payload["event_count"] = run.event_count
-    return payload
+    return _redact_public(payload)
 
 
 def comparison_to_payload(report: ComparisonReport) -> dict[str, Any]:
-    return json.loads(report.model_dump_json())
+    return _redact_public(json.loads(report.model_dump_json()))
 
 
 def metrics_to_payload(metrics: RunMetrics) -> dict[str, Any]:
-    return json.loads(metrics.model_dump_json())
+    return _redact_public(json.loads(metrics.model_dump_json()))
 
 
 def delta_summary(delta: MetricDelta) -> str:

@@ -21,6 +21,7 @@ from tracemend.adapters import (
 )
 from tracemend.adapters.generic import duration_from_time
 from tracemend.errors import TraceParseError, TraceTooLargeError, UnsupportedFormatError
+from tracemend.models import normalize_status
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -199,6 +200,24 @@ class TestGenericTrace(AdapterTestBase):
         self.assertIsNone(event.error)
         self.assertEqual(event.status, "unknown")
 
+    def test_status_wording_is_normalised_without_ok_substring_false_positives(self):
+        payload = generic_payload(
+            events=[
+                {"id": "failed", "tool": "bash", "arguments": {}, "status": "lookup failed"},
+                {"id": "negated", "tool": "grep", "arguments": {}, "status": "no errors found"},
+                {"id": "success", "tool": "read", "arguments": {}, "status": "ok"},
+                {"id": "broken", "tool": "ls", "arguments": {}, "status": "broken"},
+                {"id": "absent", "tool": "glob", "arguments": {}},
+            ]
+        )
+        run = load_trace_text(json.dumps(payload))
+        events = run.event_by_id()
+        self.assertEqual(events["failed"].status, "error")
+        self.assertEqual(events["negated"].status, "unknown")
+        self.assertEqual(events["success"].status, "success")
+        self.assertEqual(events["broken"].status, "unknown")
+        self.assertEqual(events["absent"].status, "unknown")
+
     def test_token_usage_alias_and_top_level_tokens(self):
         payload = generic_payload(
             events=[
@@ -265,6 +284,89 @@ class TestGenericTrace(AdapterTestBase):
         summary = summarise(run)
         self.assertEqual(summary.skipped_records, 1)
         self.assertTrue(any("skipped non-object" in warning for warning in run.warnings))
+
+
+class TestStatusNormalization(unittest.TestCase):
+    """``normalize_status`` must read whole words, never ``ok`` substrings."""
+
+    def test_genuine_failure_wording_is_an_error(self) -> None:
+        for raw in (
+            "lookup failed",
+            "error: token exhausted",
+            "ERROR",
+            "failed",
+            "timeout",
+            "timed out",
+            "completed_with_errors",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "error")
+
+    def test_bounded_success_wording_is_success(self) -> None:
+        for raw in (
+            "ok",
+            "OK.",
+            "ok (cached)",
+            "success",
+            "Success!",
+            "succeeded",
+            "completed",
+            "done",
+            "passed",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "success")
+
+    def test_ok_substrings_alone_do_not_prove_success(self) -> None:
+        for raw in ("broken", "token", "lookbook", "pending"):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "unknown")
+
+    def test_bounded_negation_is_neither_failure_nor_success(self) -> None:
+        for raw in (
+            "no errors found",
+            "no failure",
+            "not failed",
+            "without errors",
+            "0 errors",
+            "not ok",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "unknown")
+
+    def test_negation_of_a_failure_with_explicit_success_is_success(self) -> None:
+        for raw in ("completed without errors", "passed with no failures"):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "success")
+
+    def test_conflicting_wording_lets_the_failure_win(self) -> None:
+        for raw in (
+            "success but failed",
+            "ok then failed",
+            "completed with errors",
+            "no retries, error: timeout",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "error")
+
+    def test_explicit_bool_and_numeric_statuses_are_preserved(self) -> None:
+        cases = [
+            (True, "success"),
+            (False, "error"),
+            (0, "success"),
+            (0.0, "success"),
+            (1, "error"),
+            (2, "error"),
+            (-1, "error"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), expected)
+
+    def test_absent_and_ambiguous_statuses_stay_unknown(self) -> None:
+        for raw in (None, "", "   ", "maybe", "pending", {}, []):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_status(raw), "unknown")
 
 
 class TestRedaction(AdapterTestBase):
@@ -531,6 +633,39 @@ class TestOpenCode(AdapterTestBase):
         self.assertEqual(second.status, "error")
         self.assertEqual(second.error, "file changed on disk")
         self.assertIsNone(second.duration_ms)
+
+    def test_status_wording_is_normalised_from_tool_state(self):
+        payload = {
+            "info": {"id": "ses_status", "title": "Status wording"},
+            "messages": [
+                {
+                    "info": {"id": "msg_1", "role": "assistant"},
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {"status": "error: token exhausted", "input": {}},
+                        },
+                        {
+                            "type": "tool",
+                            "tool": "grep",
+                            "state": {"status": "no errors found", "input": {}},
+                        },
+                        {
+                            "type": "tool",
+                            "tool": "read",
+                            "state": {"status": "ok", "input": {}},
+                        },
+                        {"type": "tool", "tool": "ls", "state": {"status": "broken", "input": {}}},
+                    ],
+                }
+            ],
+        }
+        run = load_trace_text(json.dumps(payload))
+        self.assertEqual(
+            [event.status for event in run.events],
+            ["error", "unknown", "success", "unknown"],
+        )
 
     def test_legacy_flat_tool_calls_shape(self):
         payload = {

@@ -17,6 +17,9 @@ flowchart TD
         AUTO["Format detection"]
         GEN["generic.py"]
         OC["opencode.py"]
+        CC["claude_code.py (planned)"]
+        CUR["cursor.py (planned)"]
+        JL["jsonl.py<br/>(shared JSONL reader)"]
     end
 
     subgraph Core["Shared services"]
@@ -41,8 +44,14 @@ flowchart TD
     MCP --> AUTO
     AUTO --> GEN
     AUTO --> OC
+    AUTO --> CC
+    AUTO --> CUR
     GEN --> AN
     OC --> AN
+    CC --> AN
+    CUR --> AN
+    CC --> JL
+    CUR --> JL
     AN --> DET
     DET --> REP
     DET --> FIX
@@ -83,6 +92,9 @@ module's own docstring, `__all__` and top-level definitions.
 - `adapters/__init__.py` — the ingestion engine: `detect_format(payload)`, `load_trace_file(path, format=None, *, max_bytes=MAX_TRACE_BYTES)`, `load_trace_text(text, *, format=None, source_path=None)` and `summarise(run, *, skipped=0, redaction_count=0)`. It enforces the size ceiling, hashes the raw bytes, parses JSON and returns a normalized `TraceRun`; invalid JSON raises `TraceParseError`.
 - `adapters/generic.py` — the canonical TraceMend JSON trace adapter (`format: "tracemend.generic"`, `version: 1`); applies `security.redact_text`/`redact_value` and accounts for every redaction hit.
 - `adapters/opencode.py` — the OpenCode session export adapter, handling the V2 session export, the message/part export and the flat legacy export, and recording removed fields in `run.warnings`.
+- `adapters/jsonl.py` — the bounded, line-oriented JSON Lines / NDJSON reader shared by the native adapters (`MAX_JSONL_RECORDS`, `MAX_JSONL_LINE_BYTES`, `looks_like_jsonl`, `parse_jsonl`, `as_rows`, `single_session_id`). A malformed line is a hard error naming the line; blank lines are ignored.
+- `adapters/claude_code.py` — (planned) the native Claude Code session JSONL adapter.
+- `adapters/cursor.py` — (planned) the native Cursor adapter for CLI `stream-json` NDJSON and already-captured `preToolUse`/`postToolUse` hook JSONL.
 
 **Shared services**
 
@@ -98,7 +110,7 @@ module's own docstring, `__all__` and top-level definitions.
 The lifecycle of a trace is a single deterministic pipeline that both front ends drive through the same functions.
 
 1. **Ingest** — `adapters.load_trace_file` (or `load_trace_text`) reads the file through `security.read_text_limited`, hashing the raw bytes and enforcing the size ceiling.
-2. **Normalize** — `adapters.detect_format` chooses the `generic` or `opencode` adapter; the adapter redacts secrets and shapes the payload into a normalized `TraceRun` with deterministic `run_id` values, unique event ids and a post-sort `sequence`.
+2. **Normalize** — `adapters.detect_format` chooses the `generic`, `opencode`, `claude-code` or `cursor` adapter; the adapter redacts secrets and shapes the payload into a normalized `TraceRun` with deterministic `run_id` values, unique event ids and a post-sort `sequence`.
 3. **Detect** — `analyzer.analyze_run` calls `detectors.run_detectors(run)` to produce `Finding` records and `compute_metrics(run)` to produce `RunMetrics`, then assembles an `AnalysisReport`.
 4. **Report** — `reports.py` renders that report for a terminal (Rich) or as JSON. `analyzer.compare_runs` supports the before/after comparison view.
 5. **Propose** — `fixes.create_proposal(store, ...)` is a pure database operation: it records a `pending` `FixProposal` and never touches the file. `fixes.diff_for_proposal` renders the preview.

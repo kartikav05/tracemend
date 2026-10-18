@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"cursor-demo-session","model":"cursor-small","cwd":"/tmp/tracemend-demo"}
+{"type":"tool_call","subtype":"started","call_id":"call_read_1","session_id":"cursor-demo-session","timestamp":"2026-02-02T08:00:01Z","tool_call":{"readToolCall":{"args":{"path":"src/app.py"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"call_read_1","session_id":"cursor-demo-session","timestamp":"2026-02-02T08:00:02Z","tool_call":{"readToolCall":{"args":{"path":"src/app.py"},"result":{"success":{"content":"1: print('hello')","totalLines":1}}}}}
+{"type":"tool_call","subtype":"started","call_id":"call_shell_1","session_id":"cursor-demo-session","timestamp":"2026-02-02T08:00:03Z","tool_call":{"shellToolCall":{"args":{"command":"npm test"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"call_shell_1","session_id":"cursor-demo-session","timestamp":"2026-02-02T08:00:04Z","tool_call":{"shellToolCall":{"args":{"command":"npm test"},"result":{"failure":{"error":"npm ERR! auth failed for token sk-proj-EXAMPLENOTAREALKEY000000000000","exitCode":1}}}}}
+{"type":"tool_call","subtype":"started","call_id":"call_grep_1","session_id":"cursor-demo-session","timestamp":"2026-02-02T08:00:05Z","tool_call":{"grepToolCall":{"args":{"pattern":"TODO","path":"src"}}}}
+{"type":"result","subtype":"success","session_id":"cursor-demo-session","duration_ms":42000}

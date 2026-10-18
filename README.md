@@ -120,7 +120,7 @@ TM004 `payment_status` (5x) and `payment` (2x), plus three informational TM005 h
 |:--:|---|---|
 | 🔍 | **Deterministic detectors** | Five rule-based passes (TM001–TM005) over normalized calls — no LLM, no sampling, no network. |
 | 🧾 | **Evidence-backed findings** | Each finding carries call ids, severity, a confidence level, and an explicit list of what the trace cannot prove. |
-| 🧩 | **Two trace adapters** | TraceMend generic JSON and OpenCode session exports, with automatic format detection. |
+| 🧩 | **Trace adapters** | TraceMend generic JSON, OpenCode session exports, and native Claude Code and Cursor imports (planned), with automatic format detection. |
 | 🩹 | **Safe auto-fixes** | Deterministic instruction templates for search reuse, retry discipline, file-read reuse and general tool efficiency. |
 | 🔐 | **Human-gated remediation** | Proposals, diffs, single-use approvals bound to a patch hash, atomic writes, backups, conflict-safe undo. |
 | 📊 | **Run comparison** | Metric-level before/after deltas. Reports behavioural change — never claims causation. |
@@ -197,7 +197,7 @@ model-generated "approved: true" argument is ignored.
 flowchart LR
     CLI["tracemend CLI"] --> AUTO["Format detection"]
     MCP["FastMCP server<br/>(stdio)"] --> AUTO
-    AUTO --> ADP["adapters/<br/>generic · opencode"]
+    AUTO --> ADP["adapters/<br/>generic · opencode · claude-code · cursor"]
     ADP --> AN["analyzer.py<br/>metrics + orchestration"]
     AN --> DET["detectors.py<br/>TM001–TM005"]
     DET --> REP["reports.py<br/>Rich + JSON"]
@@ -251,9 +251,10 @@ v0.1.0 alpha — usable and tested, with an interface that may still change befo
 - ✅ MCP tools, resources and prompts verified through the FastMCP test client
 - ✅ Container image built and exercised for CLI and stdio MCP
 
-OpenCode is the only concrete adapter so far, detection is heuristic and rule-based, and an
-instruction patch cannot guarantee an agent will comply. Metrics show behavioural change, not
-task correctness. See [`docs/status.md`](docs/status.md) for the honest list.
+OpenCode is the only shipped concrete adapter; native Claude Code and Cursor imports are
+being added. Detection is heuristic and rule-based, and an instruction patch cannot guarantee
+an agent will comply. Metrics show behavioural change, not task correctness. See
+[`docs/status.md`](docs/status.md) for the honest list.
 
 ## Contributing
 

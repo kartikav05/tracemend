@@ -15,7 +15,7 @@ import click
 from rich.console import Console
 
 from . import __version__, fixes, reports
-from .adapters import load_trace_file
+from .adapters import SUPPORTED_FORMATS, load_trace_file
 from .analyzer import analyze_run
 from .errors import ApprovalRequiredError, TraceMendError
 from .models import AnalysisReport, TraceRun
@@ -24,6 +24,11 @@ from .storage import Store
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 OUTPUT_CHOICES = click.Choice(["text", "json"], case_sensitive=False)
 SEVERITY_CHOICES = click.Choice(["info", "low", "medium", "high"], case_sensitive=False)
+SOURCE_FORMAT_CHOICE = click.Choice(list(SUPPORTED_FORMATS), case_sensitive=False)
+SOURCE_FORMAT_HELP = (
+    "Force the input trace format instead of auto-detecting it "
+    "(generic, opencode, claude-code or cursor)."
+)
 
 
 def _console() -> Console:
@@ -88,8 +93,8 @@ def cli(ctx: click.Context, data_dir: str | None) -> None:
               help="Report rendering format.")
 @click.option("--output", type=click.Path(dir_okay=False, path_type=str), default=None,
               help="Write the JSON report to this file instead of stdout.")
-@click.option("--source-format", type=click.Choice(["generic", "opencode"]), default=None,
-              help="Force the input trace format instead of auto-detecting it.")
+@click.option("--source-format", type=SOURCE_FORMAT_CHOICE, default=None,
+              help=SOURCE_FORMAT_HELP)
 @click.option("--limit", type=int, default=None, help="Show at most this many findings.")
 @click.pass_context
 def analyze(
@@ -382,7 +387,8 @@ def _patch_payload(record: Any) -> dict[str, Any]:
 @click.argument("before", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.argument("after", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.option("--format", "output_format", type=OUTPUT_CHOICES, default="text", show_default=True)
-@click.option("--source-format", type=click.Choice(["generic", "opencode"]), default=None)
+@click.option("--source-format", type=SOURCE_FORMAT_CHOICE, default=None,
+              help=SOURCE_FORMAT_HELP)
 @click.pass_context
 def compare(ctx: click.Context, before: str, after: str, output_format: str, source_format: str | None) -> None:
     """Compare two traces: BEFORE (baseline) against AFTER (follow-up)."""

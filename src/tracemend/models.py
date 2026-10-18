@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 Severity = Literal["info", "low", "medium", "high"]
 Confidence = Literal["low", "medium", "high"]
 CallStatus = Literal["success", "error", "unknown"]
-RunSource = Literal["generic", "opencode"]
+RunSource = Literal["generic", "opencode", "claude-code", "cursor"]
 ProposalStatus = Literal["pending", "approved", "rejected", "applied", "undone", "stale"]
 PatchStatus = Literal["applied", "undone"]
 ProposalOrigin = Literal["deterministic", "ai"]

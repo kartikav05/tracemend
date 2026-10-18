@@ -151,16 +151,53 @@ in (the CLI needs a writable state directory), so the export *wrapper* is still 
 against fixtures rather than a captured file. If your version writes something different,
 please open an issue with a redacted export.
 
+## Importing native Claude Code and Cursor traces
+
+Two native adapters are being added so TraceMend can read transcripts you have
+already captured on disk — no capture-hook installation, no history scanning, and
+no new export or import commands. You point TraceMend at one explicitly chosen
+file; it never walks a directory or aggregates a tree of subagent files on its own.
+
+The planned source formats are `claude-code` and `cursor`. `tracemend analyze` and
+`tracemend compare` accept `--source-format claude-code|cursor` to force a parser,
+and the MCP `load_trace` tool already accepts a `format` argument (and auto-detects
+when you omit it).
+
+**Claude Code** — a session JSONL transcript. See
+<https://code.claude.com/docs/en/sessions>. The format is internal and
+version-sensitive: its shape can change between releases and is not a public
+contract. Import only a file you have explicitly chosen; each file is imported
+independently, and TraceMend does not promise to aggregate a directory of subagent
+transcripts into one session.
+
+**Cursor** — Cursor CLI NDJSON and already-captured hook JSONL. See
+<https://cursor.com/docs/cli/reference/output-format> and
+<https://cursor.com/docs/hooks>. TraceMend treats a CLI `stream-json` capture of a
+*new* execution as distinct from an IDE transcript. It supports already-captured
+`preToolUse`/`postToolUse` hook events; a conversational IDE transcript that lacks
+enough tool evidence is reported as an error or a warning, and TraceMend does not
+claim full IDE coverage.
+
+**JSONL handling.** Both formats use a bounded, strict JSON Lines reader: a
+malformed line is a hard error that names the line, and record-count and line-size
+limits are enforced before any record is decoded. Anything the adapter cannot read
+is surfaced as a warning or a skipped record — never invented — and tool token or
+timing data that the source does not contain stays unknown (`null`), never
+estimated. Import only transcripts you intend to analyze; do not read private agent
+histories or credentials into a run.
+
 ## Supported trace formats
 
 | Format id | Detection | Notes |
 |---|---|---|
 | `generic` (`tracemend.generic`) | `{"format": "tracemend.generic", ...}` | TraceMend's own normalized export. Recommended for CI fixtures and for tools that want a stable schema. |
 | `opencode` | `{"info", "messages"}` / `{"messages": [...]}` / `{"tool_calls": [...]}` | OpenCode session export (legacy and V2 shapes). |
+| `claude-code` | Claude Code session JSONL (planned) | Native Claude Code transcript; internal and version-sensitive (see the native-traces section above). |
+| `cursor` | Cursor `stream-json` NDJSON / hook JSONL (planned) | Native Cursor capture (see the native-traces section above). |
 
-Use `--source-format generic|opencode` to force a parser when auto-detection is not
-appropriate. Unknown layouts raise a `TraceParseError` (`UNSUPPORTED_FORMAT`) with a hint
-rather than silently importing nothing.
+Use `--source-format generic|opencode|claude-code|cursor` to force a parser when
+auto-detection is not appropriate. Unknown layouts raise a `TraceParseError`
+(`UNSUPPORTED_FORMAT`) with a hint rather than silently importing nothing.
 
 Minimal generic trace:
 

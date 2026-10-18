@@ -71,7 +71,7 @@ These end-to-end behaviours were actually run and observed in this session, usin
 
 ## Current limitations
 
-- **Two adapters only.** TraceMend generic JSON and OpenCode exports. OpenCode is the only concrete non-generic adapter; other agent frameworks need their own adapter, and the OpenCode adapter has only been validated against documented shapes and fixtures, not every release.
+- **Native adapters still landing.** TraceMend generic JSON and OpenCode exports ship today. Native `claude-code` and `cursor` imports are in progress on the feature branch and not yet in a release; the OpenCode adapter has only been validated against documented shapes and fixtures, not every release.
 - **`AGENTS.md` is the only fix target.** Instruction fixes only; TraceMend never edits source code, dependencies, MCP config or global agent settings.
 - **The detectors are small rule-based heuristics.** They match identical normalized arguments, unchanged read windows and overlapping literal search patterns. There is no semantic similarity, no embedding model and no cross-run learning, so genuinely distinct work that merely looks repetitive can be flagged — which is why every finding carries a confidence level and a limitations list.
 - **TM005 is informational only.** A tool hotspot is an observation about where a session spent effort, not a verdict that the tool use was wasteful.
@@ -90,7 +90,7 @@ None of the following is implemented in v0.1. They are listed so the scope is ex
 
 - **`tracemend doctor`** — cross-check project instructions against observed tool behaviour and report mismatches, only when both sides of the evidence exist.
 - **Multi-agent analysis** — per-agent call counts, cross-agent duplicate detection and failure hotspots using the `agent_id` / `parent_agent_id` fields already in the model.
-- **Claude Code adapter** — a third trace format alongside generic and OpenCode.
+- **Native Claude Code and Cursor imports** — first-class `claude-code` and `cursor` source formats alongside generic and OpenCode.
 - **Live analysis / capture hooks** — capture execution events through provider hooks instead of exporting after the fact.
 - **Tool-call caching recommendations** — suggest safe reuse, never automatic caching of side-effecting operations.
 - **Prompt-effectiveness evaluation** — measure whether an instruction change correlates with improved behaviour across repeated comparable runs.

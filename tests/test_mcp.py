@@ -22,6 +22,10 @@ from tracemend.mcp_server import SERVER_NAME, build_server
 from tracemend.storage import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
+CLAUDE_CODE_FIXTURE = FIXTURES / "claude_code_session.jsonl"
+CURSOR_CLI_FIXTURE = FIXTURES / "cursor_cli_session.jsonl"
+CURSOR_HOOKS_FIXTURE = FIXTURES / "cursor_hooks_session.jsonl"
 TRACE_FIXTURE = REPO_ROOT / "examples" / "inefficient_run.json"
 OPTIMIZED_FIXTURE = REPO_ROOT / "examples" / "optimized_run.json"
 AGENTS_TEMPLATE = REPO_ROOT / "examples" / "AGENTS.md"
@@ -458,6 +462,60 @@ class MCPTestCase(unittest.IsolatedAsyncioTestCase):
             other = build_server(store=Store(Path(self._tmp.name) / "state2"))
             self.assertIsNot(other, self.server)
             self.assertEqual("TraceMend", other.name)
+
+class NativeFormatMcpTests(MCPTestCase):
+    """Native transcript imports through the real in-memory MCP client."""
+
+    async def test_load_claude_code_jsonl_without_explicit_format(self) -> None:
+        async with self.client():
+            payload = await self.call("load_trace", {"path": str(CLAUDE_CODE_FIXTURE)})
+            self.assertNotIn("error", payload, payload)
+            self.assertEqual("claude-code", payload["source"])
+            self.assertEqual(4, payload["event_count"])
+            self.assertIn("claude-code", payload["supported_formats"])
+            self.assertIn("cursor", payload["supported_formats"])
+            self.assertTrue(self.store.has_run(payload["run_id"]))
+
+    async def test_load_cursor_with_explicit_format(self) -> None:
+        async with self.client():
+            for fixture in (CURSOR_CLI_FIXTURE, CURSOR_HOOKS_FIXTURE):
+                with self.subTest(fixture=fixture.name):
+                    payload = await self.call(
+                        "load_trace", {"path": str(fixture), "format": "cursor"}
+                    )
+                    self.assertNotIn("error", payload, payload)
+                    self.assertEqual("cursor", payload["source"])
+                    self.assertGreater(payload["event_count"], 0)
+
+    async def test_malformed_jsonl_returns_line_numbered_error(self) -> None:
+        broken = self.workspace / "broken.jsonl"
+        first = CLAUDE_CODE_FIXTURE.read_text(encoding="utf-8").splitlines()[1]
+        broken.write_text(first + "\n" + '{"type": "assistant", \n', encoding="utf-8")
+        async with self.client():
+            payload = await self.call("load_trace", {"path": str(broken)})
+        self.assertEqual("TRACE_PARSE_ERROR", payload["error"])
+        self.assertIn("line 2", payload["message"])
+        self.assertTrue(payload["hint"])
+        self.assertFalse(self.store.list_runs())
+
+    async def test_unknown_format_is_a_structured_error(self) -> None:
+        async with self.client():
+            payload = await self.call(
+                "load_trace", {"path": str(CLAUDE_CODE_FIXTURE), "format": "telepathy"}
+            )
+        self.assertEqual("UNSUPPORTED_FORMAT", payload["error"])
+        self.assertIn("claude-code", payload["hint"])
+
+    async def test_redaction_survives_the_store_round_trip(self) -> None:
+        async with self.client():
+            payload = await self.call("load_trace", {"path": str(CURSOR_CLI_FIXTURE)})
+            self.assertNotIn("error", payload, payload)
+            self.assertGreater(payload["redactions"], 0)
+            run = self.store.get_run(payload["run_id"])
+            serialised = run.model_dump_json()
+            self.assertNotIn("sk-proj-EXAMPLENOTAREALKEY000000000000", serialised)
+            self.assertIn("openai_key", serialised)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -318,9 +318,13 @@ def build_server(store: Store | None = None) -> FastMCP:
         TraceMend's own local store. Call this first, then `analyze_trace`.
 
         Args:
-            path: Path to a trace file (JSON). An absolute path is safest.
-            format: Optional explicit format id (for example "tracemend.generic");
-                omit to let TraceMend auto-detect.
+            path: Path to a trace file. JSON is auto-detected; Claude Code and
+                Cursor transcripts may be JSON or bounded JSON Lines (JSONL).
+                An absolute path is safest.
+            format: Optional explicit format id: "generic", "opencode",
+                "claude-code" or "cursor". Omit to let TraceMend auto-detect;
+                pass it when a transcript is ambiguous. Never point this at a
+                whole home-directory history.
 
         Returns:
             `run_id` (use it in every later call), `source`, `session_id`, `title`,
@@ -341,6 +345,7 @@ def build_server(store: Store | None = None) -> FastMCP:
                 "warnings": list(summary.warnings),
                 "redactions": summary.redactions_applied,
                 "source_path": summary.source_path,
+                "supported_formats": list(adapters.SUPPORTED_FORMATS),
             }
 
         return _guard(_impl)

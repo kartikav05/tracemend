@@ -32,6 +32,10 @@ from tracemend.cli import cli
 from tracemend.storage import DB_FILENAME, Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
+CLAUDE_CODE_FIXTURE = FIXTURES / "claude_code_session.jsonl"
+CURSOR_CLI_FIXTURE = FIXTURES / "cursor_cli_session.jsonl"
+CURSOR_HOOKS_FIXTURE = FIXTURES / "cursor_hooks_session.jsonl"
 TRACE_FIXTURE = REPO_ROOT / "examples" / "inefficient_run.json"
 OPTIMIZED_FIXTURE = REPO_ROOT / "examples" / "optimized_run.json"
 AGENTS_FIXTURE = REPO_ROOT / "examples" / "AGENTS.md"
@@ -288,6 +292,61 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertTrue((cli_dir / DB_FILENAME).is_file())
         self.assertFalse((env_dir / DB_FILENAME).exists())
+
+
+class NativeFormatCliTests(CliTestCase):
+    """Claude Code and Cursor imports through the real CLI."""
+
+    def test_analyze_auto_detects_claude_code_jsonl(self) -> None:
+        payload = self.analyze(CLAUDE_CODE_FIXTURE)
+        self.assertEqual(payload["source"], "claude-code")
+        self.assertEqual(payload["metrics"]["total_calls"], 4)
+
+    def test_analyze_accepts_explicit_claude_code_format(self) -> None:
+        result = self.invoke(
+            "analyze", str(CLAUDE_CODE_FIXTURE), "--source-format", "claude-code",
+            "--format", "json",
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["source"], "claude-code")
+        self.assertGreater(payload["metrics"]["total_calls"], 0)
+
+    def test_analyze_accepts_cursor_hook_jsonl(self) -> None:
+        payload = self.analyze(CURSOR_HOOKS_FIXTURE)
+        self.assertEqual(payload["source"], "cursor")
+        self.assertEqual(payload["metrics"]["total_calls"], 4)
+
+    def test_compare_accepts_native_formats(self) -> None:
+        result = self.invoke(
+            "compare", str(CURSOR_CLI_FIXTURE), str(CURSOR_CLI_FIXTURE),
+            "--source-format", "cursor", "--format", "json",
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["before_run_id"], payload["after_run_id"])
+
+    def test_malformed_jsonl_fails_with_line_number(self) -> None:
+        broken = self.workspace / "broken.jsonl"
+        valid = CLAUDE_CODE_FIXTURE.read_text(encoding="utf-8").splitlines()[1]
+        broken.write_text(valid + "\n" + '{"type": "assistant", \n', encoding="utf-8")
+        result = self.invoke("analyze", str(broken))
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("line 2", result.output)
+        self.assertNotIn("Traceback", result.output)
+
+    def test_help_lists_native_source_formats(self) -> None:
+        result = self.invoke("analyze", "--help")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("claude-code", result.output)
+        self.assertIn("cursor", result.output)
+
+    def test_redaction_is_applied_before_persistence(self) -> None:
+        payload = self.analyze(CURSOR_CLI_FIXTURE)
+        run = Store(self.data_dir).get_run(str(payload["run_id"]))
+        serialised = run.model_dump_json()
+        self.assertNotIn("sk-proj-EXAMPLENOTAREALKEY000000000000", serialised)
+        self.assertIn("openai_key", serialised)
 
 
 if __name__ == "__main__":

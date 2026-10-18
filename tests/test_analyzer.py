@@ -265,6 +265,59 @@ class NextStepHintTests(unittest.TestCase):
 
 
 class AnalyzeRunTests(unittest.TestCase):
+    def test_partial_measurements_are_reported_as_observations(self):
+        run = make_run([
+            make_call("a", "bash", {"command": "x"}, status="success",
+                      duration_ms=0, tokens={"input_tokens": 0}, cost=0),
+            make_call("b", "bash", {"command": "y"}),
+        ])
+        report = analyze_run(run)
+        self.assertEqual(report.metrics.duration_ms, 0)
+        self.assertEqual(report.metrics.total_tokens, 0)
+        self.assertEqual(report.metrics.total_cost, 0)
+        for label in ("Duration", "Token usage", "Cost"):
+            self.assertTrue(any(f"{label} coverage: 1/2" in note for note in report.notes))
+        self.assertTrue(any("Outcomes are unknown for 1/2" in note for note in report.notes))
+
+    def test_complete_measurements_have_no_partial_coverage_warning(self):
+        run = make_run([make_call("a", "bash", status="success", duration_ms=1,
+                                  tokens={"input_tokens": 2}, cost=0)])
+        report = analyze_run(run)
+        self.assertFalse(any("coverage:" in note for note in report.notes))
+        self.assertEqual(report.metrics.duration_ms, 1)
+        self.assertEqual(report.metrics.total_tokens, 2)
+
+    def test_absent_measurements_remain_unavailable_with_zero_coverage(self):
+        report = analyze_run(make_run([make_call("a", "bash")]))
+        self.assertIsNone(report.metrics.duration_ms)
+        self.assertIsNone(report.metrics.total_tokens)
+        self.assertIsNone(report.metrics.total_cost)
+        for label in ("Duration", "Token usage", "Cost"):
+            self.assertTrue(any(
+                f"{label} coverage: 0/1" in note and "unavailable" in note
+                for note in report.notes
+            ))
+
+    def test_legitimate_reverification_counts_are_not_claimed_as_waste(self):
+        run = make_run([
+            make_call("a", "read", {"path": "a.py"}, status="success"),
+            make_call("edit", "edit", {"path": "a.py"}, status="success"),
+            make_call("b", "read", {"path": "a.py"}, status="success"),
+        ])
+        report = analyze_run(run)
+        self.assertEqual(report.metrics.duplicate_calls, 1)
+        self.assertFalse(any(finding.code == "TM003" for finding in report.findings))
+        self.assertTrue(any("not proven waste" in note for note in report.notes))
+
+    def test_comparison_labels_partial_measurement_deltas(self):
+        before = make_run([make_call("a", "bash", duration_ms=10),
+                           make_call("b", "read")])
+        after = make_run([make_call("c", "bash", duration_ms=1)])
+        report = compare_runs(before, after)
+        self.assertEqual(report.delta_for("duration_ms").delta, -9)
+        self.assertTrue(any("Before: Duration coverage: 1/2" in note for note in report.notes))
+        self.assertTrue(any("cannot establish savings" in note for note in report.notes))
+
     def test_analyze_run_returns_sorted_findings_and_notes(self):
         run = make_run(
             [

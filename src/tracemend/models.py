@@ -66,6 +66,48 @@ TOOL_ALIASES: dict[str, str] = {
 _SUCCESS_TOKENS = {"ok", "success", "succeeded", "completed", "complete", "passed", "done", "0"}
 _ERROR_TOKENS = {"error", "failed", "failure", "fail", "errored", "exception", "timeout"}
 
+# Bounded vocabularies for prose statuses. Words are matched whole, never as
+# substrings, so "broken" and "lookbook" cannot be read as "ok".
+_SUCCESS_WORDS = frozenset(
+    {
+        "ok",
+        "okay",
+        "success",
+        "successful",
+        "successfully",
+        "succeed",
+        "succeeded",
+        "succeeds",
+        "complete",
+        "completed",
+        "done",
+        "passed",
+    }
+)
+_FAILURE_WORDS = frozenset(
+    {
+        "error",
+        "errors",
+        "errored",
+        "fail",
+        "fails",
+        "failed",
+        "failing",
+        "failure",
+        "failures",
+        "exception",
+        "exceptions",
+        "timeout",
+        "timeouts",
+    }
+)
+# Bound negation so "no errors found" is neither a failure nor a success.
+_NEGATION_WORDS = frozenset(
+    {"no", "not", "without", "zero", "none", "never", "neither", "nor", "0"}
+)
+_NEGATION_FILLERS = frozenset({"a", "an", "the", "any", "more", "further", "single", "new"})
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
 
 def utc_now() -> datetime:
     """Timezone-aware UTC timestamp."""
@@ -94,8 +136,48 @@ def normalize_tool_name(name: str) -> str:
     return TOOL_ALIASES.get(cleaned, cleaned)
 
 
+def _classify_status_words(words: list[str]) -> CallStatus:
+    """Classify pre-tokenised status prose; a genuine failure always wins."""
+    has_failure = False
+    has_success = False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in _NEGATION_WORDS:
+            target = index + 1
+            budget = 2
+            while target < len(words) and budget and words[target] in _NEGATION_FILLERS:
+                target += 1
+                budget -= 1
+            if target < len(words) and (
+                words[target] in _FAILURE_WORDS or words[target] in _SUCCESS_WORDS
+            ):
+                # "no errors", "not failed", "not ok": consume the negated word.
+                index = target + 1
+                continue
+        if word in _FAILURE_WORDS:
+            has_failure = True
+        elif word in _SUCCESS_WORDS:
+            has_success = True
+        elif word in {"timed", "time"} and index + 1 < len(words) and words[index + 1] == "out":
+            has_failure = True
+        index += 1
+    if has_failure:
+        return "error"
+    if has_success:
+        return "success"
+    return "unknown"
+
+
 def normalize_status(value: Any) -> CallStatus:
-    """Map heterogeneous status values onto a three-state model."""
+    """Map heterogeneous status values onto a three-state model.
+
+    Booleans and numbers are explicit: ``True``/``0`` mean success, ``False``
+    and any other number mean error. Text is matched on whole words, never on
+    substrings, so ``broken`` is not ``ok`` and ``lookup failed`` is an error.
+    A bounded negation (``no errors found``, ``not failed``, ``not ok``) is
+    consumed and yields ``unknown`` unless another word is decisive.
+    """
     if value is None:
         return "unknown"
     if isinstance(value, bool):
@@ -107,11 +189,7 @@ def normalize_status(value: Any) -> CallStatus:
         return "success"
     if text in _ERROR_TOKENS:
         return "error"
-    if any(token in text for token in ("success", "ok")):
-        return "success"
-    if any(token in text for token in ("fail", "error", "exception")):
-        return "error"
-    return "unknown"
+    return _classify_status_words(_WORD_RE.findall(text.replace("n't", " not")))
 
 
 def coerce_datetime(value: Any) -> datetime | None:

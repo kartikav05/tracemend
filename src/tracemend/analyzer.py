@@ -51,6 +51,10 @@ _METHODOLOGY_NOTES: tuple[str, ...] = (
     "Instruction-level findings describe observed behaviour, not task correctness.",
     "Metadata the trace does not contain (duration, tokens, cost) is reported as unavailable "
     "(None) and is never estimated or replaced with zero.",
+    "Duration, token and cost figures sum recorded values only, including per-tool figures; "
+    "partial sums are not complete run totals. Duration sums are observed tool time, not wall time.",
+    "Duplicate-call metrics count repeated argument fingerprints, not proven waste; legitimate "
+    "retries and re-verification can contribute to those counts.",
     "A tool hotspot (TM005) is an observation about where the session spent effort, not a "
     "verdict that the work was wasteful.",
 )
@@ -67,6 +71,35 @@ def _known_tokens(call: ToolCall) -> int | None:
     if call.token_usage is None:
         return None
     return call.token_usage.total
+
+
+def _measurement_notes(run: TraceRun) -> list[str]:
+    """Describe measurement coverage without changing persisted metric contracts."""
+    total = len(run.events)
+    if not total:
+        return []
+    notes: list[str] = []
+    for label, values in (
+        ("Duration", [call.duration_ms for call in run.events]),
+        ("Token usage", [_known_tokens(call) for call in run.events]),
+        ("Cost", [call.cost for call in run.events]),
+    ):
+        known = sum(value is not None for value in values)
+        if known < total:
+            limitation = (
+                "reported sums are partial observations, not complete totals."
+                if known else "the measurement is unavailable."
+            )
+            notes.append(
+                f"{label} coverage: {known}/{total} calls have recorded values; {limitation}"
+            )
+    unknown = sum(call.status == "unknown" for call in run.events)
+    if unknown:
+        notes.append(
+            f"Outcomes are unknown for {unknown}/{total} calls; failure counts include only "
+            "recorded errors, not proof that every other call succeeded."
+        )
+    return notes
 
 
 def compute_metrics(run: TraceRun) -> RunMetrics:
@@ -147,6 +180,12 @@ def compare_runs(before: TraceRun, after: TraceRun) -> ComparisonReport:
         )
 
     notes = list(_COMPARISON_NOTES)
+    notes.extend(f"Before: {note}" for note in _measurement_notes(before))
+    notes.extend(f"After: {note}" for note in _measurement_notes(after))
+    notes.append(
+        "Duration and token deltas compare recorded sums only; unequal or incomplete coverage "
+        "cannot establish savings or improved efficiency."
+    )
     if before_metrics.total_tokens is None or after_metrics.total_tokens is None:
         notes.append("Token usage was unavailable for at least one run.")
     if before_metrics.duration_ms is None or after_metrics.duration_ms is None:
@@ -171,6 +210,7 @@ def analyze_run(run: TraceRun) -> AnalysisReport:
     metrics = compute_metrics(run)
     findings: list[Finding] = sort_findings(run_detectors(run))
     notes = list(_METHODOLOGY_NOTES)
+    notes.extend(_measurement_notes(run))
     if not findings:
         notes.append(
             "No inefficient tool-usage patterns matched the current rules for this run; this is "

@@ -10,6 +10,14 @@ Every detector reads one `TraceRun` and returns `Finding` records.
 There is no language model, no network access, no filesystem access and no randomness involved, so the same run always produces the same findings, in the same order, with the same ids.
 They never fabricate a value: a metric that is absent from the trace is reported as `null`, and the finding says so in its `details.limitations`.
 
+Run and per-tool duration, token and cost figures sum only recorded values. A partial
+sum is not a complete total; analysis and comparison notes identify missing coverage.
+Zero remains a real recorded value, distinct from `null`. Summed tool duration is not
+wall-clock elapsed time. Failure counts include recorded errors only; unknown outcomes
+are not successes. The duplicate-call metric counts repeated argument fingerprints,
+including legitimate retries and re-verification, rather than proven waste. Comparisons
+of partial sums cannot establish savings or improved task outcomes.
+
 | Code | Detection | Severity | Evidence used | Fixable |
 |---|---|---|---|---|
 | **TM001** | Duplicate tool calls — the same non-read, non-search call repeated with an identical canonicalized argument hash | Scales with redundant count (`high` at 5+, `medium` at 3+, `low` otherwise) | Normalized tool name, canonical argument hash, call ids, intervening writes/reads for the touched paths | Yes |
@@ -25,8 +33,8 @@ See [How to read a finding](#how-to-read-a-finding).
 
 Ownership is defined so the detectors never double-report the same call:
 
-- Reads belong to TM003.
-- Search-like calls — the normalized tool is `grep`/`glob`, or the call carries a `pattern`/`query` argument — belong to TM004.
+- Non-failing reads belong to TM003.
+- Non-failing search-like calls — the normalized tool is `grep`/`glob`, or the call carries a `pattern`/`query` argument — belong to TM004.
 - Repeated failures belong to TM002, because a repeated failure is a retry-discipline problem rather than a general duplicate-call problem.
 - Everything else falls to TM001.
 
@@ -133,8 +141,13 @@ The detector code names the category; the `id` is unique *within* a run, so two 
 ## TM003 — Repeated file reads
 
 **What it detects.**
-Several reads of one file with no observable modification in between.
-Reads are grouped per normalized path into windows, and a window closes whenever a write or edit touches that path, because changed content makes the next read legitimate again.
+Several reads of the same file page with no observable modification in between.
+Reads are grouped per normalized path and recorded pagination arguments into windows.
+Different `offset`/`limit`/`range` values are not treated as identical coverage;
+malformed ranges cannot establish redundancy. Missing pagination is explicitly uncertain.
+A successful write or edit touching the path closes the window. An unknown-outcome
+write also closes it conservatively, without claiming a change occurred; a failed
+write does not establish a modification.
 
 **Evidence it cites.**
 The call ids of the redundant reads (`window[1:]`), the normalized path, the window size and redundant-read count, and two explicit booleans: whether the run recorded any modification data at all, and whether it recorded a modification of this specific file.
@@ -148,25 +161,33 @@ $ read src/payments.py   # call_009
 $ read src/payments.py   # call_014
 ```
 
-Analysing `examples/inefficient_run.json` captures this window as `TM003:read:a255e6d624ab` ("Repeated reads of src/payments.py (4x)", `medium`/`high`).
+Analysing `examples/inefficient_run.json` captures this window as `TM003:read:a255e6d624ab` ("Repeated reads of src/payments.py (4x)", `medium`/`medium`): pagination coverage is not recorded.
 
 **What it deliberately does not flag.**
 
 - The first read of each window is treated as legitimate and is never cited as evidence.
 - Reads that follow a write or edit to the same path — the window is reset, so re-reading changed content is expected.
 - Failed reads, which never enter a window.
+- Different pages or uninterpretable ranges, which cannot prove repeated coverage.
 
 **Limitation.**
 The rule is only as strong as the trace's modification data, and it lowers its own confidence accordingly.
 When the trace records no file-modification data anywhere, confidence drops to `low` and the finding states that it cannot be proven the content stayed the same — the file may have changed on disk without being recorded.
 When the trace has modification data but none of it touches this file, confidence drops one step and the finding states that the file is *treated as* unchanged between these reads.
+Unknown coverage and reads spanning several agents reduce confidence; an edit elsewhere
+does not prove that a read covered the same content.
 
 ## TM004 — Redundant search patterns
 
 **What it detects.**
 Two related search redundancies.
-First, identical searches — the same tool, pattern and scope issued more than once, grouped by `call_fingerprint`.
-Second, a broad search whose pattern is a substring of a narrower pattern over the same scope and whose result fingerprint is identical, meaning the narrower search had already covered the same results.
+First, identical searches — the same tool, pattern and scope issued more than once,
+grouped by `call_fingerprint` within windows separated by relevant successful or
+unknown-outcome writes. The first search after a possible content change is legitimate.
+Second, a broad search whose pattern is a substring of an **earlier** narrower pattern
+over the same scope and whose result fingerprint is identical. An intervening possible
+content change prevents the earlier search from establishing reusable coverage.
+Order follows the normalized event list; timestamps are not invented when absent.
 
 **Evidence it cites.**
 For repeated searches: the call ids of the repeats (`calls[1:]`), the matched ids, the normalized pattern and scope, the result fingerprints, and the redundant-search count.
@@ -182,18 +203,24 @@ $ grep 'payment_status' src   # call_018
 $ grep 'payment_status' src   # call_022
 ```
 
-Analysing `examples/inefficient_run.json` captures this group as `TM004:grep:552ea5012837` ("Repeated search (5x): 'payment_status' in src", `medium`/`high`).
+In `examples/inefficient_run.json`, the successful edit at `call_015` splits this
+pattern into a three-call group (`call_001`, `call_002`, `call_008`) and a two-call
+group (`call_018`, `call_022`). The first search in each group is legitimate;
+only `call_002`, `call_008` and `call_022` are cited as redundant searches.
 
 **What it deliberately does not flag.**
 
 - The first search of a group is treated as legitimate and is never cited as evidence.
 - A single search, however broad.
 - A broad/narrower pair whose result fingerprints differ, are missing, or whose scopes differ — the narrower search must have demonstrably returned the same results.
+- Failed searches (TM002 owns repeated failures), later narrower searches, and
+  searches separated by a relevant possible content change.
 - A call already claimed by the repeated-search grouping, so one search is never reported twice.
 
 **Severity ladder.**
 Repeated searches follow the shared ladder: 5+ redundant searches are `high`, 3+ are `medium`, fewer are `low`.
-A broad search already covered by a narrower one is fixed at `low` severity and `high` confidence, and always cites exactly one call.
+A broad search already covered by a narrower one is fixed at `low` severity, starts
+at `high` confidence (lower across agents), and always cites exactly one call.
 
 **Limitation.**
 This is a lightweight literal heuristic over normalized patterns and result fingerprints; there is no semantic similarity, embedding or stemming step, so it only catches textual containment — `payment` inside `payment_status` — never two differently worded searches that mean the same thing.
@@ -218,7 +245,12 @@ Analysing `examples/inefficient_run.json` captures `TM005:bash:fbe07d688c13` ("T
 
 **Limitation.**
 TM005 is informational and never invents token or cost data.
-It is fixed at `info` severity with `medium` confidence and `fixable: false`, and its description ends by noting that a hotspot is an observation about where the session spent effort, not a verdict that the tool use was wasted.
+It is fixed at `info` severity with `fixable: false`; confidence starts at `medium`
+and drops when the triggering measurement has incomplete coverage. Its description
+notes that a hotspot is an observation about where the session spent effort, not a
+verdict that the tool use was wasted. `details.measurement_coverage` records run-wide
+counts for durations, tokens, costs and known outcomes; limitations identify partial
+sums and observed-time shares that cannot establish complete-run dominance.
 When the trace contains no token, cost or duration data, the corresponding figures stay `null` and the finding records a `limitations` entry saying the figure was not present anywhere in the trace — it is never estimated and never reported as zero.
 
 ## Finding schema

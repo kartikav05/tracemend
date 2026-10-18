@@ -41,8 +41,10 @@ arguments, the working directory, or the strategy based on the error you observe
 <!-- tracemend:end -->
 ```
 
-Proposals are idempotent: proposing the same finding and strategy for the same target file
-returns the existing proposal rather than creating a second one.
+Proposals are idempotent for the same finding, strategy, workspace, target file and
+original file state while the proposal is pending or approved. Changed content or
+existence, a different workspace, or a terminal proposal requires a fresh proposal
+and a new human approval; an undone proposal is not silently reused.
 
 **Preview.** `tracemend fix diff <proposal-id>` prints the exact unified diff, the patch
 hash and the base file hash:
@@ -85,8 +87,10 @@ Without a TTY it fails closed:
 > **Note.** Approval is a human act, so `fix approve` needs a terminal. In a container that
 > means `docker run -it`; see [Containers](./containers.md) for the volume and TTY setup.
 
-**Apply.** `tracemend fix apply <proposal-id>` re-verifies all of the above, then writes
-atomically and records the patch:
+**Apply.** `tracemend fix apply <proposal-id>` re-verifies all of the above
+under a cooperative workspace lock, saves a durable operation intent, then writes
+atomically and records the patch. Existing file metadata is copied to the replacement
+before it becomes visible; the backup is an independent snapshot, not a hard link:
 
 ```
 ──────────────────────────────── APPLIED PATCH ─────────────────────────────────
@@ -100,6 +104,50 @@ Applied: 2026-10-14T17:51:07.447995+00:00
 **Undo.** `tracemend fix undo <patch-id>` restores the file from the recorded original
 content — but only if the file still matches what TraceMend applied. If you edited the file
 afterwards, the undo is refused rather than overwriting your work.
+The backup must match the recorded original hash before restoration. An existing
+empty `AGENTS.md` is restored as an empty file; a file is removed only when the patch
+records that the original was absent. Legacy patches with unknown original existence
+restore empty bytes rather than guessing that deletion is safe.
+
+### Interrupted operations and concurrent writers
+
+Apply and undo record intent in the local SQLite operation journal before changing
+the target. Finalization updates the operation, patch and proposal together in one
+transaction. Retrying the corresponding apply or undo reconciles an interrupted
+operation under the workspace lock:
+
+- If the target has the expected post-operation existence and content hash, the
+  landed change can be recorded without writing the file again.
+- If the original state remains, the untouched intent can be aborted before retry.
+- An unrecognized state or unverifiable backup requires manual review; recovery
+  does not overwrite the file or create a human approval.
+
+After an interruption, inspect `tracemend fix list --format json` for the proposal
+status and patch id. A retry may report that an operation is already applied or
+undone after reconciling it; do not re-approve an old proposal to force another write.
+The service also exposes `recover_pending(store)` for local callers; there is no
+separate recovery CLI command or MCP tool.
+
+Writers lock the canonical workspace directory itself, so separate local stores
+targeting the same workspace serialize without creating a workspace lockfile.
+These are advisory POSIX locks: unrelated editors and older TraceMend versions do
+not participate, and network filesystem locking is not guaranteed. Hash and path
+checks remain necessary. Ambiguous legacy duplicate applied patches are preserved
+but block further apply/undo until manually resolved.
+
+Schema v2 adds the operation journal without rewriting existing proposal, approval
+or patch payloads. New records include original-file existence; legacy records may
+leave it unknown. Databases from a newer schema version are rejected rather than
+silently downgraded. Do not run older writers against the upgraded store.
+
+Metadata preservation uses native macOS ACL/stat/xattr copying and Linux extended
+attributes. Unsupported platforms, including Windows, fail closed for remediation
+rather than silently losing metadata or proceeding without workspace locking.
+Platform-specific checks do not imply that every filesystem supports these features.
+New files retain the private `0600` creation mode (subject to a stricter umask),
+rather than inheriting an unrelated file's permissions or enabling group/world access.
+Invalid UTF-8 instruction files are refused rather than decoded with replacement
+characters and silently rewritten.
 
 Exit codes are stable for scripting: `2` parse/usage, `3` not found / not fixable,
 `4` security refusal, `5` approval required / stale file / proposal conflict.

@@ -11,13 +11,16 @@ from tracemend import security
 from tracemend.errors import (
     FindingNotFoundError,
     PatchNotFoundError,
+    ProposalConflictError,
     ProposalNotFoundError,
     RunNotFoundError,
+    TraceMendError,
 )
 from tracemend.models import (
     AnalysisReport,
     ApprovalRecord,
     Finding,
+    FixOperation,
     FixProposal,
     PatchRecord,
     RunMetrics,
@@ -307,6 +310,273 @@ class TestDataDir(unittest.TestCase):
             self.assertEqual(store.data_dir, Path(tmp))
             self.assertTrue(store.db_path.exists())
             self.assertTrue(store.backup_dir.exists())
+
+
+class TestSchemaMigration(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.data_dir = Path(temporary.name)
+
+    def _write_v1_db(self) -> None:
+        import json
+        import sqlite3
+
+        from tracemend.storage import DB_FILENAME
+
+        path = self.data_dir / DB_FILENAME
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE proposals (
+                    proposal_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                    finding_id TEXT NOT NULL, strategy TEXT NOT NULL,
+                    target_file TEXT NOT NULL, workspace TEXT NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE approvals (
+                    approval_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE,
+                    approved_at TEXT NOT NULL, payload TEXT NOT NULL
+                );
+                CREATE TABLE patches (
+                    patch_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL, status TEXT NOT NULL,
+                    applied_at TEXT NOT NULL, payload TEXT NOT NULL
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO meta VALUES('schema_version', '1')"
+            )
+            proposal = make_proposal(status="applied")
+            proposal_payload = json.loads(proposal.model_dump_json())
+            proposal_payload.pop("original_existed", None)
+            connection.execute(
+                "INSERT INTO proposals VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    proposal.proposal_id,
+                    proposal.run_id,
+                    proposal.finding_id,
+                    proposal.strategy,
+                    proposal.target_file,
+                    proposal.workspace,
+                    "applied",
+                    proposal.created_at.isoformat(),
+                    json.dumps(proposal_payload),
+                ),
+            )
+            approval = ApprovalRecord(
+                approval_id="appr_v1",
+                proposal_id=proposal.proposal_id,
+                patch_sha256=proposal.patch_sha256,
+                workspace=proposal.workspace,
+                target_file=proposal.target_file,
+                original_sha256=proposal.original_sha256,
+            )
+            approval_payload = json.loads(approval.model_dump_json())
+            approval_payload.pop("original_existed", None)
+            connection.execute(
+                "INSERT INTO approvals VALUES(?, ?, ?, ?)",
+                (
+                    approval.approval_id,
+                    approval.proposal_id,
+                    approval.approved_at.isoformat(),
+                    json.dumps(approval_payload),
+                ),
+            )
+            patch = PatchRecord(
+                patch_id="patch_v1",
+                proposal_id=proposal.proposal_id,
+                run_id=RUN_ID,
+                workspace=proposal.workspace,
+                target_file=proposal.target_file,
+                strategy=proposal.strategy,
+                original_sha256=security.EMPTY_SHA256,
+                applied_sha256=sha256_text("applied"),
+                backup_path="/tmp/backups/AGENTS.md.bak",
+            )
+            patch_payload = json.loads(patch.model_dump_json())
+            patch_payload.pop("original_existed", None)
+            connection.execute(
+                "INSERT INTO patches VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    patch.patch_id,
+                    patch.proposal_id,
+                    patch.run_id,
+                    patch.status,
+                    patch.applied_at.isoformat(),
+                    json.dumps(patch_payload),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_v1_to_v2_is_additive_and_preserves_rows(self) -> None:
+        self._write_v1_db()
+        store = Store(self.data_dir)
+        self.assertEqual(store.get_proposal("prop_1").status, "applied")
+        self.assertIsNone(store.get_proposal("prop_1").original_existed)
+        self.assertEqual(store.get_approval("prop_1").approval_id, "appr_v1")
+        patch = store.get_patch("patch_v1")
+        self.assertEqual(patch.status, "applied")
+        self.assertIsNone(patch.original_existed)
+        self.assertEqual(store.list_operations(), [])
+        self.assertEqual(store.applied_patch_count("prop_1"), 1)
+
+    def test_future_schema_version_is_rejected(self) -> None:
+        import sqlite3
+
+        from tracemend.storage import DB_FILENAME
+
+        path = self.data_dir / DB_FILENAME
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO meta VALUES('schema_version', '99')")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(TraceMendError):
+            Store(self.data_dir)
+
+    def test_duplicate_legacy_patches_are_preserved_and_flagged(self) -> None:
+        store = Store(self.data_dir)
+        for index in (1, 2):
+            store.save_patch(
+                PatchRecord(
+                    patch_id=f"patch_dup_{index}",
+                    proposal_id="prop_1",
+                    run_id=RUN_ID,
+                    workspace="/tmp/workspace",
+                    target_file="AGENTS.md",
+                    strategy="search_efficiency",
+                    original_sha256=security.EMPTY_SHA256,
+                    applied_sha256=sha256_text(f"applied-{index}"),
+                    backup_path=f"/tmp/backups/{index}.bak",
+                )
+            )
+        self.assertEqual(store.applied_patch_count("prop_1"), 2)
+        self.assertEqual(len(store.list_patches(proposal_id="prop_1")), 2)
+        operation = FixOperation(
+            operation_id="op_dup",
+            kind="apply",
+            proposal_id="prop_1",
+            patch_id="patch_new",
+            run_id=RUN_ID,
+            workspace="/tmp/workspace",
+            target_file="AGENTS.md",
+            backup_path="/tmp/backups/new.bak",
+            original_sha256=security.EMPTY_SHA256,
+            original_existed=False,
+            expected_sha256=sha256_text("new"),
+        )
+        with self.assertRaises(ProposalConflictError):
+            store.begin_operation(operation)
+        self.assertEqual(len(store.list_patches(proposal_id="prop_1")), 2)
+
+
+class TestOperations(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.store = Store(self.root / "state")
+
+    def _operation(self, *, kind: str = "apply", operation_id: str = "op_1") -> FixOperation:
+        return FixOperation(
+            operation_id=operation_id,
+            kind=kind,
+            proposal_id="prop_1",
+            patch_id="patch_1",
+            run_id=RUN_ID,
+            workspace="/tmp/workspace",
+            target_file="AGENTS.md",
+            backup_path="/tmp/backups/AGENTS.md.bak",
+            original_sha256=security.EMPTY_SHA256,
+            original_existed=False,
+            expected_sha256=sha256_text("applied"),
+        )
+
+    def test_one_live_intent_per_proposal(self) -> None:
+        self.store.begin_operation(self._operation())
+        with self.assertRaises(ProposalConflictError):
+            self.store.begin_operation(self._operation(operation_id="op_2"))
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+
+    def test_finish_operation_commits_journal_patch_and_proposal(self) -> None:
+        self.store.save_proposal(make_proposal(status="approved"))
+        operation = self.store.begin_operation(self._operation())
+        proposal = self.store.get_proposal("prop_1")
+        patch = PatchRecord(
+            patch_id="patch_1",
+            proposal_id="prop_1",
+            run_id=RUN_ID,
+            workspace="/tmp/workspace",
+            target_file="AGENTS.md",
+            strategy="search_efficiency",
+            original_sha256=security.EMPTY_SHA256,
+            applied_sha256=sha256_text("applied"),
+            backup_path="/tmp/backups/AGENTS.md.bak",
+            original_existed=False,
+        )
+        proposal.status = "applied"
+        proposal.patch_id = "patch_1"
+        self.store.finish_operation(
+            operation, status="committed", patch=patch, proposal=proposal
+        )
+        self.assertEqual(self.store.get_operation("op_1").status, "committed")
+        self.assertEqual(self.store.get_patch("patch_1").status, "applied")
+        self.assertEqual(self.store.get_proposal("prop_1").status, "applied")
+        self.assertEqual(self.store.list_live_operations(), [])
+
+    def test_abort_only_touches_the_journal(self) -> None:
+        self.store.save_proposal(make_proposal(status="approved"))
+        operation = self.store.begin_operation(self._operation())
+        self.store.finish_operation(operation, status="aborted", detail="no write")
+        self.assertEqual(self.store.get_operation("op_1").status, "aborted")
+        self.assertEqual(self.store.get_proposal("prop_1").status, "approved")
+        self.assertEqual(self.store.list_patches(proposal_id="prop_1"), [])
+
+    def test_find_proposal_for_respects_status_workspace_and_state(self) -> None:
+        legacy = make_proposal(status="undone")
+        legacy.original_existed = False
+        self.store.save_proposal(legacy)
+        self.assertIsNone(
+            self.store.find_proposal_for(
+                RUN_ID,
+                "TM004:bash:abcdef",
+                "AGENTS.md",
+                "search_efficiency",
+                workspace="/tmp/workspace",
+                original_existed=False,
+            )
+        )
+        active = make_proposal(status="pending")
+        active.original_existed = False
+        self.store.save_proposal(active)
+        found = self.store.find_proposal_for(
+            RUN_ID,
+            "TM004:bash:abcdef",
+            "AGENTS.md",
+            "search_efficiency",
+            workspace="/tmp/workspace",
+            original_existed=False,
+        )
+        self.assertIsNotNone(found)
+        self.assertIsNone(
+            self.store.find_proposal_for(
+                RUN_ID,
+                "TM004:bash:abcdef",
+                "AGENTS.md",
+                "search_efficiency",
+                workspace="/other/workspace",
+                original_existed=False,
+            )
+        )
 
 
 if __name__ == "__main__":

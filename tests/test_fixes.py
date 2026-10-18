@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tracemend import fixes, security
 from tracemend.errors import (
@@ -15,7 +16,15 @@ from tracemend.errors import (
     StaleFileError,
     UndoConflictError,
 )
-from tracemend.models import AnalysisReport, Finding, TraceRun, sha256_text
+from tracemend.models import (
+    AnalysisReport,
+    ApprovalRecord,
+    Finding,
+    FixOperation,
+    FixProposal,
+    TraceRun,
+    sha256_text,
+)
 from tracemend.storage import Store
 
 RUN_ID = "run_fixtest"
@@ -226,8 +235,10 @@ class TestDuplicatePrevention(FixesTestBase):
         self.write_agents(ORIGINAL)
         proposal = self.propose(finding)
         self.write_agents(fixes.render_updated_content(ORIGINAL, proposal.instruction_text))
-        again = self.propose(finding)
-        self.assertEqual(again.proposal_id, proposal.proposal_id)
+        # The original state changed, so the pending proposal is not silently
+        # reused; the caller must re-create it against the current file.
+        with self.assertRaises(ProposalConflictError):
+            self.propose(finding)
         self.assertEqual(len(self.store.list_proposals(run_id=RUN_ID)), 1)
 
 
@@ -452,6 +463,468 @@ class TestAiOrigin(FixesTestBase):
         self.assertEqual(proposal.status, "pending")
         with self.assertRaises(ApprovalRequiredError):
             fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+
+
+class TestExistenceIntegrity(FixesTestBase):
+    def test_undo_keeps_preexisting_empty_file(self) -> None:
+        """Regression: an empty file that already existed must not be deleted."""
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        self.write_agents("")
+        _, patch = self.approve_and_apply(finding)
+        self.assertTrue(patch.original_existed)
+        self.assertEqual(patch.original_sha256, security.EMPTY_SHA256)
+
+        fixes.undo_patch(self.store, patch.patch_id)
+        self.assertTrue(self.agents_path().exists())
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), "")
+
+    def test_apply_rejects_missing_then_empty(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        proposal = self.propose(finding)
+        self.assertFalse(proposal.original_existed)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        self.write_agents("")
+        with self.assertRaises(StaleFileError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+
+    def test_approval_binds_original_existence(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        record = fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        record.original_existed = False
+        self.store.save_approval(record)
+        with self.assertRaises(ApprovalRequiredError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+
+    def test_legacy_patch_without_existence_restores_empty_bytes(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        _, patch = self.approve_and_apply(finding)
+        legacy = self.store.get_patch(patch.patch_id)
+        legacy.original_existed = None
+        self.store.save_patch(legacy)
+        fixes.undo_patch(self.store, patch.patch_id)
+        self.assertTrue(self.agents_path().exists())
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), "")
+
+
+class TestRecovery(FixesTestBase):
+    def _crash_finalize(self, finding):
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with mock.patch.object(
+            Store, "finish_operation", side_effect=RuntimeError("crash")
+        ), self.assertRaises(RuntimeError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        return proposal
+
+    def test_crash_after_write_is_recovered(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self._crash_finalize(finding)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+
+        fixes.recover_pending(self.store)
+
+        loaded = self.store.get_proposal(proposal.proposal_id)
+        self.assertEqual(loaded.status, "applied")
+        patches = self.store.list_patches(proposal_id=proposal.proposal_id)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].status, "applied")
+        self.assertEqual(self.store.list_live_operations(), [])
+
+    def test_crash_before_write_aborts_intent(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with mock.patch.object(
+            security, "atomic_write_text", side_effect=OSError("disk full")
+        ), self.assertRaises(OSError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+
+        patch = fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(patch.status, "applied")
+
+    def test_unknown_third_state_is_not_overwritten(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self._crash_finalize(finding)
+        self.write_agents(ORIGINAL + "\nSomeone else edited.\n")
+        fixes.recover_pending(self.store)
+
+        self.assertEqual(
+            self.agents_path().read_text(encoding="utf-8"),
+            ORIGINAL + "\nSomeone else edited.\n",
+        )
+        reviews = self.store.list_operations(status="needs_review")
+        self.assertEqual(len(reviews), 1)
+        with self.assertRaises(ProposalConflictError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+
+    def test_crash_after_undo_restore_is_recovered(self) -> None:
+        finding = make_finding("TM004", "search_efficiency")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal, patch = self.approve_and_apply(finding)
+        with mock.patch.object(
+            Store, "finish_operation", side_effect=RuntimeError("crash")
+        ), self.assertRaises(RuntimeError):
+            fixes.undo_patch(self.store, patch.patch_id)
+
+        fixes.recover_pending(self.store)
+
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "undone")
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "undone")
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+
+    def test_crash_before_undo_restore_keeps_patch_applied(self) -> None:
+        finding = make_finding("TM004", "search_efficiency")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        _, patch = self.approve_and_apply(finding)
+        with mock.patch.object(
+            security, "atomic_restore", side_effect=OSError("interrupted")
+        ), self.assertRaises(OSError):
+            fixes.undo_patch(self.store, patch.patch_id)
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "applied")
+        undone = fixes.undo_patch(self.store, patch.patch_id)
+        self.assertEqual(undone.status, "undone")
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+
+    def test_tampered_backup_is_rejected(self) -> None:
+        finding = make_finding("TM004", "search_efficiency")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        _, patch = self.approve_and_apply(finding)
+        Path(patch.backup_path).write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(ProposalConflictError):
+            fixes.undo_patch(self.store, patch.patch_id)
+        self.assertNotEqual(
+            self.agents_path().read_text(encoding="utf-8"), "tampered\n"
+        )
+
+
+class TestProposalIdentity(FixesTestBase):
+    def test_undone_proposal_is_not_reused(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal, patch = self.approve_and_apply(finding)
+        fixes.undo_patch(self.store, patch.patch_id)
+        fresh = self.propose(finding)
+        self.assertNotEqual(fresh.proposal_id, proposal.proposal_id)
+        self.assertEqual(fresh.status, "pending")
+
+    def test_workspace_is_part_of_proposal_identity(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        first = self.propose(finding)
+        other = self.root / "workspace-2"
+        other.mkdir()
+        second = fixes.create_proposal(
+            store=self.store,
+            run_id=RUN_ID,
+            finding_id=finding.id,
+            workspace=other,
+        )
+        self.assertNotEqual(first.proposal_id, second.proposal_id)
+        self.assertNotEqual(first.workspace, second.workspace)
+
+
+class TestTerminalStates(FixesTestBase):
+    def test_terminal_proposal_cannot_be_approved_again(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal, patch = self.approve_and_apply(finding)
+        fixes.undo_patch(self.store, patch.patch_id)
+        with self.assertRaises(ProposalConflictError):
+            fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+
+
+class TestLifecycleIntegrity(FixesTestBase):
+    def test_crlf_bytes_and_mode_survive_apply_and_undo(self) -> None:
+        finding = make_finding("TM004", "search_efficiency")
+        self.seed([finding])
+        original = "# AGENTS.md\r\n\r\nAlways run the tests.\r\n"
+        self.write_agents(original)
+        self.agents_path().chmod(0o640)
+        mode = self.agents_path().stat().st_mode & 0o777
+
+        _, patch = self.approve_and_apply(finding)
+        applied = self.agents_path().read_bytes()
+        self.assertIn(b"\r\n", applied)
+        self.assertEqual(self.agents_path().stat().st_mode & 0o777, mode)
+
+        fixes.undo_patch(self.store, patch.patch_id)
+        self.assertEqual(self.agents_path().read_bytes(), original.encode("utf-8"))
+        self.assertEqual(self.agents_path().stat().st_mode & 0o777, mode)
+
+    def test_rollback_failure_leaves_recoverable_intent(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with (
+            mock.patch.object(Store, "_write_patch", side_effect=RuntimeError("db")),
+            self.assertRaises(RuntimeError),
+        ):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "applied")
+        self.assertEqual(len(self.store.list_live_operations()), 0)
+
+    def test_two_stores_serialise_the_same_proposal(self) -> None:
+        import concurrent.futures as futures
+
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        second_store = Store(self.store.data_dir)
+
+        def run(store):
+            try:
+                return fixes.apply_proposal(store, proposal.proposal_id).status
+            except ProposalConflictError:
+                return "conflict"
+
+        with futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(run, [self.store, second_store])
+            )
+        self.assertIn("applied", results)
+        self.assertEqual(len(self.store.list_patches(proposal_id=proposal.proposal_id)), 1)
+
+
+class TestEncodingIntegrity(FixesTestBase):
+    def test_invalid_utf8_refuses_proposal_without_touching_file(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        malformed = b"# AGENTS.md\n\nbad byte: \xff\xfe\n"
+        self.agents_path().write_bytes(malformed)
+        with self.assertRaises(SecurityError):
+            self.propose(finding)
+        self.assertEqual(self.agents_path().read_bytes(), malformed)
+        self.assertEqual(self.store.list_proposals(run_id=RUN_ID), [])
+
+    def test_legacy_proposal_cannot_write_malformed_bytes(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        malformed = b"# AGENTS.md\n\nbad byte: \xff\n"
+        self.agents_path().write_bytes(malformed)
+        proposal = FixProposal(
+            proposal_id="prop_legacy_bad",
+            run_id=RUN_ID,
+            finding_id=finding.id,
+            code=finding.code,
+            strategy="general_tool_efficiency",
+            title="legacy",
+            rationale="legacy hypothesis",
+            instruction_text="Avoid repeating identical tool calls.",
+            workspace=str(self.workspace.resolve()),
+            target_file="AGENTS.md",
+            original_sha256=security.sha256_bytes(malformed),
+            original_content="# AGENTS.md\n",
+            proposed_sha256=sha256_text("proposed"),
+            patch="--- a/AGENTS.md\n+++ b/AGENTS.md\n",
+            status="approved",
+            original_existed=True,
+        )
+        self.store.save_proposal(proposal)
+        self.store.save_approval(
+            ApprovalRecord(
+                approval_id="appr_legacy_bad",
+                proposal_id=proposal.proposal_id,
+                patch_sha256=proposal.patch_sha256,
+                workspace=proposal.workspace,
+                target_file=proposal.target_file,
+                original_sha256=proposal.original_sha256,
+                original_existed=True,
+            )
+        )
+        with self.assertRaises(SecurityError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(self.agents_path().read_bytes(), malformed)
+        self.assertEqual(self.store.list_patches(proposal_id=proposal.proposal_id), [])
+        self.assertEqual(list(self.store.backup_dir.iterdir()), [])
+
+
+class TestDurabilityBarrier(FixesTestBase):
+    def _interrupt_barrier(self):
+        return mock.patch.object(
+            fixes, "_fsync_directory", side_effect=SecurityError("fsync denied")
+        )
+
+    def test_apply_fsync_failure_leaves_recoverable_intent(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with self._interrupt_barrier(), self.assertRaises(SecurityError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+
+        expected = fixes.render_updated_content(ORIGINAL, proposal.instruction_text)
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), expected)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "applied")
+        self.assertEqual(self.store.list_live_operations(), [])
+
+    def test_undo_existing_fsync_failure_is_recoverable(self) -> None:
+        finding = make_finding("TM004", "search_efficiency")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal, patch = self.approve_and_apply(finding)
+        with self._interrupt_barrier(), self.assertRaises(SecurityError):
+            fixes.undo_patch(self.store, patch.patch_id)
+
+        self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "applied")
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "undone")
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "undone")
+
+    def test_undo_missing_original_fsync_failure_is_recoverable(self) -> None:
+        finding = make_finding("TM001", "general_tool_efficiency")
+        self.seed([finding])
+        _, patch = self.approve_and_apply(finding)
+        with self._interrupt_barrier(), self.assertRaises(SecurityError):
+            fixes.undo_patch(self.store, patch.patch_id)
+
+        self.assertFalse(self.agents_path().exists())
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "applied")
+        self.assertEqual(len(self.store.list_live_operations()), 1)
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "undone")
+        self.assertFalse(self.agents_path().exists())
+
+    def test_transient_fsync_failure_only_commits_after_success(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        real_fsync_directory = fixes._fsync_directory
+        with (
+            mock.patch.object(
+                fixes,
+                "_fsync_directory",
+                side_effect=[SecurityError("transient"), real_fsync_directory],
+            ),
+            self.assertRaises(SecurityError),
+        ):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        self.assertEqual(len(self.store.list_operations(status="intent")), 1)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+
+        fixes.recover_pending(self.store)
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "applied")
+        self.assertEqual(len(self.store.list_operations(status="intent")), 0)
+
+
+class TestRecoveryIsolation(FixesTestBase):
+    def test_orphan_intent_does_not_starve_valid_intent(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        orphan = FixOperation(
+            operation_id="op_orphan",
+            kind="apply",
+            proposal_id="prop_missing",
+            patch_id="patch_orphan",
+            run_id=RUN_ID,
+            workspace=str(self.workspace.resolve()),
+            target_file="AGENTS.md",
+            backup_path=str(self.store.backup_dir / "missing.bak"),
+            original_sha256=security.EMPTY_SHA256,
+            original_existed=False,
+            expected_sha256=sha256_text("orphan"),
+        )
+        self.store.begin_operation(orphan)
+
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with mock.patch.object(
+            Store, "finish_operation", side_effect=RuntimeError("crash")
+        ), self.assertRaises(RuntimeError):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+
+        fixes.recover_pending(self.store)
+
+        orphan_after = self.store.get_operation("op_orphan")
+        self.assertEqual(orphan_after.status, "needs_review")
+        self.assertIn("missing", orphan_after.detail or "")
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "applied")
+        self.assertEqual(len(self.store.list_live_operations()), 0)
+
+
+class TestFinalizationReviewErrors(FixesTestBase):
+    def test_apply_reports_manual_review_when_finalization_cannot_commit(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal = self.propose(finding)
+        fixes.approve_proposal(self.store, proposal.proposal_id, confirm=True)
+        with (
+            mock.patch.object(
+                security, "verify_backup",
+                side_effect=[None, SecurityError("backup became unavailable")],
+            ),
+            self.assertRaisesRegex(ProposalConflictError, "needs manual review"),
+        ):
+            fixes.apply_proposal(self.store, proposal.proposal_id)
+        reviews = self.store.list_operations(status="needs_review")
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(self.store.list_patches(proposal_id=proposal.proposal_id), [])
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "approved")
+        self.assertEqual(
+            self.agents_path().read_text(encoding="utf-8"),
+            fixes.render_updated_content(ORIGINAL, proposal.instruction_text),
+        )
+
+    def test_undo_reports_manual_review_instead_of_returning_applied_patch(self) -> None:
+        finding = make_finding("TM003", "file_read_reuse")
+        self.seed([finding])
+        self.write_agents(ORIGINAL)
+        proposal, patch = self.approve_and_apply(finding)
+        with (
+            mock.patch.object(
+                security, "verify_backup",
+                side_effect=[None, SecurityError("backup became unavailable")],
+            ),
+            self.assertRaisesRegex(ProposalConflictError, "needs manual review"),
+        ):
+            fixes.undo_patch(self.store, patch.patch_id)
+        self.assertEqual(len(self.store.list_operations(status="needs_review")), 1)
+        self.assertEqual(self.store.get_patch(patch.patch_id).status, "applied")
+        self.assertEqual(self.store.get_proposal(proposal.proposal_id).status, "applied")
         self.assertEqual(self.agents_path().read_text(encoding="utf-8"), ORIGINAL)
 
 

@@ -18,6 +18,7 @@ Invariants enforced here:
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,12 +26,22 @@ from . import security
 from .errors import (
     ApprovalRequiredError,
     NotFixableError,
+    PatchNotFoundError,
     ProposalConflictError,
+    ProposalNotFoundError,
     SecurityError,
     StaleFileError,
     UndoConflictError,
 )
-from .models import ApprovalRecord, FixProposal, PatchRecord, new_id, sha256_text, utc_now
+from .models import (
+    ApprovalRecord,
+    FixOperation,
+    FixProposal,
+    PatchRecord,
+    new_id,
+    sha256_text,
+    utc_now,
+)
 from .storage import Store
 
 __all__ = [
@@ -44,6 +55,7 @@ __all__ = [
     "build_unified_diff",
     "create_proposal",
     "diff_for_proposal",
+    "recover_pending",
     "render_updated_content",
     "undo_patch",
     "verify_approval",
@@ -270,14 +282,23 @@ def create_proposal(
     workspace_path = security.resolve_workspace(workspace)
     target_path = security.resolve_target_path(workspace_path, relative_target)
 
+    original_existed = target_path.exists()
     original_content = (
-        security.read_text_limited(target_path) if target_path.exists() else ""
+        _read_target_text(target_path) if original_existed else ""
     )
     original_sha256 = security.sha256_file_or_empty(target_path)
 
     updated_content = render_updated_content(original_content, instruction)
 
-    existing = store.find_proposal_for(run_id, finding_id, relative_target, strategy)
+    existing = store.find_proposal_for(
+        run_id,
+        finding_id,
+        relative_target,
+        strategy,
+        workspace=str(workspace_path),
+        original_sha256=original_sha256,
+        original_existed=original_existed,
+    )
 
     if updated_content == original_content:
         if existing is not None:
@@ -321,6 +342,7 @@ def create_proposal(
         evidence=list(finding.evidence),
         limitations=list(template.limitations),
         status="pending",
+        original_existed=original_existed,
     )
     return store.save_proposal(proposal)
 
@@ -339,10 +361,10 @@ def approve_proposal(
     """Record an explicit human approval bound to the exact proposal patch."""
     proposal = store.get_proposal(proposal_id)
 
-    if proposal.status in {"applied", "undone"}:
+    if proposal.status not in {"pending", "approved"}:
         raise ProposalConflictError(
-            f"proposal {proposal_id} is already {proposal.status}",
-            hint="Nothing to approve.",
+            f"proposal {proposal_id} is {proposal.status}",
+            hint="Create a fresh proposal before approving it again.",
         )
 
     if not confirm:
@@ -359,6 +381,7 @@ def approve_proposal(
         target_file=proposal.target_file,
         original_sha256=proposal.original_sha256,
         approved_by=approved_by,
+        original_existed=proposal.original_existed,
     )
     store.save_approval(record)
 
@@ -366,6 +389,21 @@ def approve_proposal(
     proposal.approval_id = record.approval_id
     store.save_proposal(proposal)
     return record
+
+
+def _approval_mismatches(proposal: FixProposal, record: ApprovalRecord) -> list[str]:
+    mismatches: list[str] = []
+    if record.patch_sha256 != proposal.patch_sha256:
+        mismatches.append("patch hash")
+    if record.workspace != proposal.workspace:
+        mismatches.append("workspace")
+    if record.target_file != proposal.target_file:
+        mismatches.append("target file")
+    if record.original_sha256 != proposal.original_sha256:
+        mismatches.append("original file hash")
+    if record.original_existed != proposal.original_existed:
+        mismatches.append("original file existence")
+    return mismatches
 
 
 def verify_approval(store: Store, proposal_id: str) -> ApprovalRecord:
@@ -377,15 +415,7 @@ def verify_approval(store: Store, proposal_id: str) -> ApprovalRecord:
             f"no approval recorded for proposal {proposal_id}",
             hint="Approve the proposal with `tracemend fix approve` first.",
         )
-    mismatches: list[str] = []
-    if record.patch_sha256 != proposal.patch_sha256:
-        mismatches.append("patch hash")
-    if record.workspace != proposal.workspace:
-        mismatches.append("workspace")
-    if record.target_file != proposal.target_file:
-        mismatches.append("target file")
-    if record.original_sha256 != proposal.original_sha256:
-        mismatches.append("original file hash")
+    mismatches = _approval_mismatches(proposal, record)
     if mismatches:
         raise ApprovalRequiredError(
             f"approval does not match proposal {proposal_id}: {'; '.join(mismatches)} changed",
@@ -394,8 +424,299 @@ def verify_approval(store: Store, proposal_id: str) -> ApprovalRecord:
     return record
 
 
+# ------------------------------------------------------ journal and recovery
+
+
+def _observe(target_path: Path) -> tuple[bool, str]:
+    """Observe existence and bytes together; a missing file is not an empty one."""
+    try:
+        return True, security.sha256_file(target_path)
+    except FileNotFoundError:
+        return False, security.EMPTY_SHA256
+
+
+def _read_target_text(target_path: Path) -> str:
+    """Read the target as strict UTF-8 without newline translation.
+
+    ``errors="replace"`` would silently turn invalid bytes into U+FFFD, so a
+    later write could destroy the user's original file. Refuse instead.
+    """
+    size = target_path.stat().st_size
+    if size > security.MAX_TRACE_BYTES:
+        raise SecurityError(
+            f"target file is {size} bytes, limit is {security.MAX_TRACE_BYTES} bytes",
+            hint="Trim AGENTS.md before letting TraceMend edit it.",
+        )
+    try:
+        with target_path.open("r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except UnicodeDecodeError as exc:
+        raise SecurityError(
+            f"{target_path.name} is not valid UTF-8: {exc}",
+            hint="Re-encode the file as UTF-8; TraceMend will not rewrite it.",
+        ) from exc
+
+
+def _resolve_edit_target(workspace: str, target_file: str) -> tuple[Path, Path]:
+    workspace_path = security.resolve_workspace(workspace)
+    return workspace_path, security.resolve_target_path(workspace_path, target_file)
+
+
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise SecurityError(f"cannot fsync {path}: {exc}") from exc
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a deletion or rename durable; fail closed when it cannot be synced."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        raise SecurityError(f"cannot open {directory} for fsync: {exc}") from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise SecurityError(f"cannot fsync {directory}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _durability_barrier(target_path: Path) -> None:
+    """Require a successful fsync of the file (if present) and its directory.
+
+    A matching hash only proves the page cache agrees; it does not prove the
+    mutation survives a crash. Every way of committing a landed operation must
+    pass through this barrier, and a failure leaves the journal intent intact.
+    """
+    if target_path.exists():
+        _fsync_file(target_path)
+    _fsync_directory(target_path.parent)
+
+
+def _operation_landed(operation: FixOperation, exists: bool, sha256: str) -> bool:
+    if operation.kind == "apply":
+        return exists and sha256 == operation.expected_sha256
+    if operation.original_existed is False:
+        return not exists
+    return exists and sha256 == operation.expected_sha256
+
+
+def _operation_untouched(operation: FixOperation, exists: bool, sha256: str) -> bool:
+    if operation.kind == "apply":
+        if sha256 != operation.original_sha256:
+            return False
+        if operation.original_existed is None:
+            return True  # legacy proposal could not distinguish missing/empty
+        return exists == operation.original_existed
+    return exists and sha256 == operation.applied_sha256
+
+
+def _mark_needs_review(store: Store, operation: FixOperation, detail: str) -> FixOperation:
+    store.finish_operation(operation, status="needs_review", detail=detail)
+    return operation
+
+
+def _patch_for(
+    operation: FixOperation, proposal: FixProposal, applied_sha256: str
+) -> PatchRecord:
+    return PatchRecord(
+        patch_id=operation.patch_id,
+        proposal_id=proposal.proposal_id,
+        run_id=proposal.run_id,
+        workspace=proposal.workspace,
+        target_file=proposal.target_file,
+        strategy=proposal.strategy,
+        original_sha256=operation.original_sha256,
+        applied_sha256=applied_sha256,
+        backup_path=operation.backup_path,
+        original_existed=operation.original_existed,
+    )
+
+
+def _finalize_landed(
+    store: Store,
+    operation: FixOperation,
+    target_path: Path,
+) -> FixOperation:
+    """Record a filesystem mutation that demonstrably landed, without writing."""
+    observed_exists, observed_sha256 = _observe(target_path)
+    if not _operation_landed(operation, observed_exists, observed_sha256):
+        return _mark_needs_review(
+            store, operation, "target changed before the durability barrier"
+        )
+    # Never report durable success on hash alone: the barrier must succeed
+    # before any journal/patch/proposal commit. A failure propagates and the
+    # intent stays recoverable.
+    _durability_barrier(target_path)
+
+    proposal = store.get_proposal(operation.proposal_id)
+    try:
+        security.verify_backup(operation.backup_path, operation.original_sha256)
+    except (OSError, SecurityError) as exc:
+        return _mark_needs_review(
+            store, operation, f"backup cannot be verified: {exc}"
+        )
+
+    if operation.kind == "apply":
+        if proposal.status == "applied":
+            if proposal.patch_id == operation.patch_id:
+                store.finish_operation(operation, status="committed")
+                return operation
+            return _mark_needs_review(
+                store, operation, "proposal was applied by a different patch"
+            )
+        if proposal.status != "approved":
+            return _mark_needs_review(
+                store, operation, f"proposal is {proposal.status}, not approved"
+            )
+        approval = store.get_approval(proposal.proposal_id)
+        if approval is None or _approval_mismatches(proposal, approval):
+            # Recovery never invents or refreshes a human approval.
+            return _mark_needs_review(store, operation, "approval no longer binds")
+        patch = _patch_for(operation, proposal, operation.expected_sha256)
+        proposal.status = "applied"
+        proposal.applied_at = utc_now()
+        proposal.applied_sha256 = operation.expected_sha256
+        proposal.patch_id = patch.patch_id
+        store.finish_operation(
+            operation, status="committed", patch=patch, proposal=proposal
+        )
+        return operation
+
+    patch = store.get_patch(operation.patch_id)
+    if patch.status == "undone":
+        if proposal.status == "undone":
+            store.finish_operation(operation, status="committed")
+            return operation
+        return _mark_needs_review(store, operation, "patch undone but proposal is not")
+    if proposal.status != "applied":
+        return _mark_needs_review(
+            store, operation, f"proposal is {proposal.status}, not applied"
+        )
+    patch.status = "undone"
+    patch.undone_at = utc_now()
+    proposal.status = "undone"
+    store.finish_operation(
+        operation, status="committed", patch=patch, proposal=proposal
+    )
+    return operation
+
+
+def _recover_operation(store: Store, operation: FixOperation) -> FixOperation:
+    """Isolate a missing referenced record instead of starving later intents."""
+    try:
+        return _recover_one(store, operation)
+    except (ProposalNotFoundError, PatchNotFoundError) as exc:
+        return _mark_needs_review(
+            store, operation, f"referenced record is missing: {exc}"
+        )
+
+
+def _recover_one(store: Store, operation: FixOperation) -> FixOperation:
+    """Classify one intent by observed existence and hash; never guess-write."""
+    # Resolve referenced records before touching the filesystem: an orphaned
+    # intent must become needs_review, never be classified as "untouched".
+    store.get_proposal(operation.proposal_id)
+    if operation.kind == "undo":
+        store.get_patch(operation.patch_id)
+    try:
+        _, target_path = _resolve_edit_target(operation.workspace, operation.target_file)
+    except SecurityError as exc:
+        return _mark_needs_review(store, operation, f"workspace is no longer safe: {exc}")
+
+    exists, sha256 = _observe(target_path)
+    if _operation_landed(operation, exists, sha256):
+        return _finalize_landed(store, operation, target_path)
+    if _operation_untouched(operation, exists, sha256):
+        store.finish_operation(
+            operation,
+            status="aborted",
+            detail="interrupted before the filesystem change; target untouched",
+        )
+        return operation
+    return _mark_needs_review(
+        store,
+        operation,
+        "target is in an unknown third state "
+        f"(exists={exists}, sha256={sha256}); refusing to overwrite",
+    )
+
+
+def _recover_for(
+    store: Store, *, proposal_id: str | None = None, patch_id: str | None = None
+) -> None:
+    """Recover live intents while the caller already holds the workspace lock."""
+    for operation in store.list_live_operations(
+        proposal_id=proposal_id, patch_id=patch_id
+    ):
+        try:
+            _recover_operation(store, operation)
+        except (ProposalConflictError, ProposalNotFoundError, PatchNotFoundError):
+            continue
+
+
+def recover_pending(store: Store) -> list[FixOperation]:
+    """Reconcile every interrupted apply/undo; safe to call repeatedly.
+
+    Recovery only observes files, verifies backups and updates metadata. It
+    never writes the target and never grants an approval. One orphaned intent
+    or durability failure must not starve unrelated recoverable intents.
+    """
+    recovered: list[FixOperation] = []
+    first_error: SecurityError | None = None
+    for operation in store.list_operations(status="intent"):
+        try:
+            try:
+                workspace_path, _ = _resolve_edit_target(
+                    operation.workspace, operation.target_file
+                )
+            except SecurityError:
+                recovered.append(_recover_operation(store, operation))
+                continue
+            with security.workspace_lock(workspace_path, timeout=10.0):
+                recovered.append(_recover_operation(store, operation))
+        except (ProposalConflictError, ProposalNotFoundError, PatchNotFoundError):
+            # Another writer already settled this intent; keep going.
+            continue
+        except SecurityError as exc:
+            # The intent stays live and recoverable; report after the sweep.
+            first_error = first_error or exc
+            recovered.append(operation)
+    if first_error is not None:
+        raise first_error
+    return recovered
+
+
+def _require_review_free(store: Store, proposal_id: str) -> None:
+    reviews = store.list_operations(status="needs_review", proposal_id=proposal_id)
+    if reviews:
+        raise ProposalConflictError(
+            f"proposal {proposal_id} has an operation needing manual review",
+            hint="Inspect AGENTS.md and the recorded backup before retrying.",
+        )
+
+
+def _settle_failed_write(
+    store: Store, operation: FixOperation, target_path: Path
+) -> FixOperation:
+    exists, sha256 = _observe(target_path)
+    if _operation_landed(operation, exists, sha256):
+        return _finalize_landed(store, operation, target_path)
+    if _operation_untouched(operation, exists, sha256):
+        store.finish_operation(
+            operation, status="aborted", detail="filesystem write failed; target untouched"
+        )
+        return operation
+    return _mark_needs_review(
+        store, operation, "write failed and the target is in an unknown third state"
+    )
+
+
 def apply_proposal(store: Store, proposal_id: str) -> PatchRecord:
-    """Apply an approved proposal to disk, atomically and with a backup."""
+    """Apply an approved proposal under a cooperative lock and durable journal."""
     proposal = store.get_proposal(proposal_id)
 
     if proposal.status != "approved":
@@ -410,65 +731,123 @@ def apply_proposal(store: Store, proposal_id: str) -> PatchRecord:
         )
 
     verify_approval(store, proposal_id)
-
     workspace_path = security.resolve_workspace(proposal.workspace)
-    target_path = security.resolve_target_path(workspace_path, proposal.target_file)
 
-    current_sha256 = security.sha256_file_or_empty(target_path)
-    if current_sha256 != proposal.original_sha256:
-        raise StaleFileError(
-            f"{proposal.target_file} changed since the proposal was created",
-            hint="Re-create the proposal against the current file contents.",
+    with security.workspace_lock(workspace_path, timeout=10.0):
+        # Re-resolve the target under the lock so symlink/containment guards see
+        # the state that will actually be written.
+        _, target_path = _resolve_edit_target(
+            proposal.workspace, proposal.target_file
         )
+        live_apply = [
+            operation
+            for operation in store.list_live_operations(proposal_id=proposal_id)
+            if operation.kind == "apply"
+        ]
+        _recover_for(store, proposal_id=proposal_id)
+        proposal = store.get_proposal(proposal_id)
+        if (
+            proposal.status == "applied"
+            and proposal.patch_id is not None
+            and proposal.patch_id in {operation.patch_id for operation in live_apply}
+        ):
+            # This call's recovery committed an apply whose write had landed.
+            return store.get_patch(proposal.patch_id)
+        if proposal.status != "approved":
+            raise ProposalConflictError(
+                f"proposal {proposal_id} is {proposal.status}, not approved",
+                hint="Create and approve a fresh proposal.",
+            )
+        verify_approval(store, proposal_id)
+        _require_review_free(store, proposal_id)
 
-    if store.list_patches(proposal_id=proposal_id):
-        raise ProposalConflictError(
-            f"proposal {proposal_id} has already been applied",
-            hint="Undo the existing patch before applying again.",
+        applied = store.applied_patch_count(proposal_id)
+        if applied > 1:
+            raise ProposalConflictError(
+                f"proposal {proposal_id} has {applied} applied patches",
+                hint="Patch history is ambiguous; resolve it manually before applying.",
+            )
+        if applied == 1:
+            raise ProposalConflictError(
+                f"proposal {proposal_id} has already been applied",
+                hint="Undo the existing patch before applying again.",
+            )
+
+        exists, current_sha256 = _observe(target_path)
+        if (
+            proposal.original_existed is not None
+            and exists != proposal.original_existed
+        ):
+            raise StaleFileError(
+                f"{proposal.target_file} existence changed since the proposal was created",
+                hint="Re-create the proposal against the current file contents.",
+            )
+        if current_sha256 != proposal.original_sha256:
+            raise StaleFileError(
+                f"{proposal.target_file} changed since the proposal was created",
+                hint="Re-create the proposal against the current file contents.",
+            )
+
+        current_content = _read_target_text(target_path) if exists else ""
+        updated_content = render_updated_content(current_content, proposal.instruction_text)
+        if updated_content == current_content:
+            raise ProposalConflictError(
+                "the managed instruction is already present in the target file",
+                hint="Nothing to apply; the target already contains this instruction.",
+            )
+        expected_sha256 = sha256_text(updated_content)
+
+        backup_path = security.make_backup(target_path, store.backup_dir)
+        security.verify_backup(backup_path, proposal.original_sha256)
+
+        operation = FixOperation(
+            operation_id=new_id("op"),
+            kind="apply",
+            proposal_id=proposal.proposal_id,
+            patch_id=new_id("patch"),
+            run_id=proposal.run_id,
+            workspace=proposal.workspace,
+            target_file=proposal.target_file,
+            backup_path=str(backup_path),
+            original_sha256=proposal.original_sha256,
+            original_existed=proposal.original_existed,
+            expected_sha256=expected_sha256,
         )
+        store.begin_operation(operation)
 
-    current_content = security.read_text_limited(target_path) if target_path.exists() else ""
-    updated_content = render_updated_content(current_content, proposal.instruction_text)
-    if updated_content == current_content:
-        raise ProposalConflictError(
-            "the managed instruction is already present in the target file",
-            hint="Nothing to apply; the target already contains this instruction.",
-        )
+        try:
+            security.atomic_write_text(
+                target_path,
+                updated_content,
+                metadata_source=str(target_path) if exists else None,
+            )
+        except BaseException:
+            settled = _settle_failed_write(store, operation, target_path)
+            if settled.status == "committed":
+                return store.get_patch(operation.patch_id)
+            raise
 
-    backup_path = security.make_backup(target_path, store.backup_dir)
-    security.atomic_write_text(target_path, updated_content)
+        exists_after, sha256_after = _observe(target_path)
+        if not _operation_landed(operation, exists_after, sha256_after):
+            _mark_needs_review(
+                store, operation, "write did not produce the expected bytes"
+            )
+            raise ProposalConflictError(
+                "the write did not produce the expected content",
+                hint="The file was modified concurrently; review the target manually.",
+            )
 
-    applied_sha256 = security.sha256_file(target_path)
-    if applied_sha256 != sha256_text(updated_content):
-        raise ProposalConflictError(
-            "the write did not produce the expected content",
-            hint="The file was modified concurrently; review the target manually.",
-        )
-
-    patch = PatchRecord(
-        patch_id=new_id("patch"),
-        proposal_id=proposal.proposal_id,
-        run_id=proposal.run_id,
-        workspace=proposal.workspace,
-        target_file=proposal.target_file,
-        strategy=proposal.strategy,
-        original_sha256=proposal.original_sha256,
-        applied_sha256=applied_sha256,
-        backup_path=str(backup_path),
-        status="applied",
-    )
-    store.save_patch(patch)
-
-    proposal.status = "applied"
-    proposal.applied_at = utc_now()
-    proposal.applied_sha256 = applied_sha256
-    proposal.patch_id = patch.patch_id
-    store.save_proposal(proposal)
-    return patch
+        finalized = _finalize_landed(store, operation, target_path)
+        if finalized.status != "committed":
+            raise ProposalConflictError(
+                f"operation {operation.operation_id} needs manual review",
+                hint="Inspect AGENTS.md and the recorded backup before retrying.",
+            )
+        return store.get_patch(operation.patch_id)
 
 
 def undo_patch(store: Store, patch_id: str) -> PatchRecord:
-    """Restore the pre-patch bytes, refusing to clobber later unrelated edits."""
+    """Restore the pre-patch state, refusing to clobber later unrelated edits."""
     patch = store.get_patch(patch_id)
 
     if patch.status != "applied":
@@ -478,34 +857,85 @@ def undo_patch(store: Store, patch_id: str) -> PatchRecord:
         )
 
     workspace_path = security.resolve_workspace(patch.workspace)
-    target_path = security.resolve_target_path(workspace_path, patch.target_file)
 
-    current_sha256 = security.sha256_file_or_empty(target_path)
-    if current_sha256 != patch.applied_sha256:
-        raise UndoConflictError(
-            f"{patch.target_file} changed after TraceMend applied its patch",
-            hint="Revert the later edits manually; TraceMend will not overwrite them.",
+    with security.workspace_lock(workspace_path, timeout=10.0):
+        # Re-resolve under the lock, matching the apply path's guards.
+        _, target_path = _resolve_edit_target(patch.workspace, patch.target_file)
+        live_undo = [
+            operation
+            for operation in store.list_live_operations(patch_id=patch_id)
+            if operation.kind == "undo"
+        ]
+        _recover_for(store, patch_id=patch_id)
+        patch = store.get_patch(patch_id)
+        if patch.status == "undone" and live_undo:
+            # This call recovered an interrupted undo whose restore had landed.
+            return patch
+        if patch.status != "applied":
+            raise ProposalConflictError(
+                f"patch {patch_id} is already {patch.status}",
+                hint="Only an applied patch can be undone.",
+            )
+        _require_review_free(store, patch.proposal_id)
+        if store.applied_patch_count(patch.proposal_id) > 1:
+            raise ProposalConflictError(
+                f"proposal {patch.proposal_id} has multiple applied patches",
+                hint="Patch history is ambiguous; resolve it manually before undoing.",
+            )
+
+        exists, current_sha256 = _observe(target_path)
+        if not exists or current_sha256 != patch.applied_sha256:
+            raise UndoConflictError(
+                f"{patch.target_file} changed after TraceMend applied its patch",
+                hint="Revert the later edits manually; TraceMend will not overwrite them.",
+            )
+
+        backup_path = Path(patch.backup_path)
+        security.verify_backup(backup_path, patch.original_sha256)
+
+        operation = FixOperation(
+            operation_id=new_id("op"),
+            kind="undo",
+            proposal_id=patch.proposal_id,
+            patch_id=patch.patch_id,
+            run_id=patch.run_id,
+            workspace=patch.workspace,
+            target_file=patch.target_file,
+            backup_path=str(backup_path),
+            original_sha256=patch.original_sha256,
+            original_existed=patch.original_existed,
+            expected_sha256=patch.original_sha256,
+            applied_sha256=patch.applied_sha256,
         )
+        store.begin_operation(operation)
 
-    backup_path = Path(patch.backup_path)
-    if not backup_path.exists():
-        raise ProposalConflictError(
-            f"backup for patch {patch_id} is missing",
-            hint="The pre-patch content cannot be restored automatically.",
-        )
+        try:
+            if patch.original_existed is False:
+                target_path.unlink()
+                _fsync_directory(target_path.parent)
+            else:
+                # Legacy ``None`` restores empty bytes instead of deleting.
+                security.atomic_restore(target_path, backup_path)
+        except BaseException:
+            settled = _settle_failed_write(store, operation, target_path)
+            if settled.status == "committed":
+                return store.get_patch(patch_id)
+            raise
 
-    if patch.original_sha256 == security.EMPTY_SHA256:
-        target_path.unlink(missing_ok=True)
-    else:
-        security.atomic_write_text(
-            target_path, backup_path.read_text(encoding="utf-8")
-        )
+        exists_after, sha256_after = _observe(target_path)
+        if not _operation_landed(operation, exists_after, sha256_after):
+            _mark_needs_review(
+                store, operation, "restore did not produce the expected bytes"
+            )
+            raise UndoConflictError(
+                "the restore did not produce the expected content",
+                hint="The target was modified concurrently; review it manually.",
+            )
 
-    patch.status = "undone"
-    patch.undone_at = utc_now()
-    store.save_patch(patch)
-
-    proposal = store.get_proposal(patch.proposal_id)
-    proposal.status = "undone"
-    store.save_proposal(proposal)
-    return patch
+        finalized = _finalize_landed(store, operation, target_path)
+        if finalized.status != "committed":
+            raise ProposalConflictError(
+                f"operation {operation.operation_id} needs manual review",
+                hint="Inspect AGENTS.md and the recorded backup before retrying.",
+            )
+        return store.get_patch(patch_id)

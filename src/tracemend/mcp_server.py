@@ -27,6 +27,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.resources import FunctionResource
+from mcp.types import CallToolResult, TextContent
 
 from . import adapters, analyzer, fixes
 from .errors import ApprovalRequiredError, TraceMendError
@@ -53,6 +54,13 @@ MAX_EVIDENCE_PREVIEW = 400
 #: Bounds for finding listings.
 DEFAULT_FINDING_LIMIT = 20
 MAX_FINDING_LIMIT = 200
+#: Longest evidence list returned per finding.
+MAX_FINDING_EVIDENCE = 5
+#: Preview length for proposal prose and diffs sent to a client. The exact patch
+#: stays in the local store, and the human reviews it with the CLI
+#: (``tracemend fix diff``) before approving.
+MAX_PROPOSAL_TEXT = 2000
+MAX_DIFF_PREVIEW = 4000
 
 #: Real local-CLI commands (see ``tracemend.cli``). Approval is CLI-only and
 #: deliberately unreachable from the MCP surface.
@@ -142,20 +150,37 @@ def _approval_error(proposal_id: str, exc: TraceMendError | None = None) -> dict
     return payload
 
 
-def _guard(operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    """Run a tool body, converting every failure into a structured error dict."""
+def _error_result(payload: dict[str, Any]) -> CallToolResult:
+    """Wrap an error payload in a result that actually reports a failure.
+
+    Returning the dict alone made every failed call look like a successful tool
+    result carrying an ``error`` key, so a client had to inspect the body to know
+    something went wrong. ``isError=True`` states it in the protocol, and the
+    structured payload plus the JSON text keep the existing contract intact.
+    """
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=to_json_text(payload))],
+        structuredContent=payload,
+    )
+
+
+def _guard(operation: Callable[[], dict[str, Any]]) -> dict[str, Any] | CallToolResult:
+    """Run a tool body, converting every failure into a structured error result."""
     try:
         return operation()
     except TraceMendError as exc:
-        return exc.to_dict()
+        return _error_result(exc.to_dict())
     except FileNotFoundError as exc:
-        return {
-            "error": "FILE_NOT_FOUND",
-            "message": str(exc),
-            "hint": "Check the path (prefer an absolute path) and try again.",
-        }
+        return _error_result(
+            {
+                "error": "FILE_NOT_FOUND",
+                "message": str(exc),
+                "hint": "Check the path (prefer an absolute path) and try again.",
+            }
+        )
     except Exception as exc:
-        return _unexpected_error(exc)
+        return _error_result(_unexpected_error(exc))
 
 
 def _bounded_text(value: str | None, limit: int = MAX_EVIDENCE_PREVIEW) -> str | None:
@@ -175,8 +200,19 @@ def _bounded_arguments(arguments: Any, limit: int = MAX_ARGUMENT_PREVIEW) -> Any
     return limit_preview(serialized, limit)
 
 
+def _bounded_list(values: Any, limit: int = MAX_FINDING_EVIDENCE) -> list[str]:
+    """Redact and truncate a bounded list of free-text evidence strings."""
+    bounded = [
+        _bounded_text(str(item), MAX_EVIDENCE_PREVIEW) for item in list(values or [])[:limit]
+    ]
+    return [text for text in bounded if text]
+
+
 def _finding_payload(finding: Any) -> dict[str, Any]:
-    return finding_to_payload(finding)
+    """Outbound finding payload: always redacted, with bounded evidence."""
+    payload = finding_to_payload(finding)
+    payload["evidence"] = _bounded_list(finding.evidence)
+    return payload
 
 
 def _prompt_findings(store: Store, run_id: str) -> tuple[Any, list[dict[str, Any]]]:
@@ -370,13 +406,18 @@ def build_server(store: Store | None = None) -> FastMCP:
             holdings.save_report(report)
             _register_run_resources(mcp, holdings, run_id, registered)
             payload = report_to_payload(report)
+            # Same bound as `get_findings`, so one tool cannot return a far larger
+            # response than the other for the same run.
+            findings = list(report.findings)[:MAX_FINDING_LIMIT]
             return {
                 "run_id": payload["run_id"],
                 "session_id": payload["session_id"],
                 "title": payload["title"],
                 "source": payload["source"],
                 "metrics": payload["metrics"],
-                "findings": payload["findings"],
+                "findings": [_finding_payload(finding) for finding in findings],
+                "finding_count": len(report.findings),
+                "findings_truncated": len(report.findings) > len(findings),
                 "notes": payload["notes"],
             }
 
@@ -535,11 +576,12 @@ def build_server(store: Store | None = None) -> FastMCP:
                 "code": proposal.code,
                 "target_file": proposal.target_file,
                 "strategy": proposal.strategy,
-                "explanation": proposal.rationale,
-                "title": proposal.title,
-                "proposed_instruction": proposal.instruction_text,
-                "patch": proposal.patch,
+                "explanation": _bounded_text(proposal.rationale, MAX_PROPOSAL_TEXT),
+                "title": _bounded_text(proposal.title, MAX_PROPOSAL_TEXT),
+                "proposed_instruction": _bounded_text(proposal.instruction_text, MAX_PROPOSAL_TEXT),
+                "patch": _bounded_text(proposal.patch, MAX_DIFF_PREVIEW),
                 "status": proposal.status,
+                "patch_sha256": proposal.patch_sha256,
                 "approval_required": True,
                 "approval_source": "local CLI only",
                 "next_steps": [
@@ -562,9 +604,15 @@ def build_server(store: Store | None = None) -> FastMCP:
         READ-ONLY: this tool never writes to the workspace and never applies the
         patch. Safe to call before and after approval.
 
+        The returned `diff` is redacted and bounded, because it is derived from a
+        file in your workspace (not from an imported trace), so the file's own
+        secrets are not protected by import-time redaction. The exact patch stays
+        in the local store and is what the human reviews with
+        `tracemend fix diff <proposal_id>` before approving.
+
         Returns:
-            The proposal metadata plus `diff` (unified diff text) and whether a
-            human approval is already stored (`approved`).
+            The proposal metadata plus `diff` (redacted unified diff text) and
+            whether a human approval is already stored (`approved`).
         """
 
         def _impl() -> dict[str, Any]:
@@ -578,16 +626,17 @@ def build_server(store: Store | None = None) -> FastMCP:
                 "finding_id": proposal.finding_id,
                 "target_file": proposal.target_file,
                 "strategy": proposal.strategy,
-                "title": proposal.title,
-                "explanation": proposal.rationale,
+                "title": _bounded_text(proposal.title, MAX_PROPOSAL_TEXT),
+                "explanation": _bounded_text(proposal.rationale, MAX_PROPOSAL_TEXT),
                 "status": proposal.status,
                 "origin": proposal.origin,
-                "instruction_text": proposal.instruction_text,
-                "diff": diff,
+                "instruction_text": _bounded_text(proposal.instruction_text, MAX_PROPOSAL_TEXT),
+                "diff": _bounded_text(diff, MAX_DIFF_PREVIEW),
                 "original_sha256": proposal.original_sha256,
                 "proposed_sha256": proposal.proposed_sha256,
                 "patch_sha256": proposal.patch_sha256,
-                "limitations": list(proposal.limitations),
+                "limitations": _bounded_list(proposal.limitations, MAX_FINDING_EVIDENCE),
+                "redacted": True,
                 "approved": bool(approval is not None and approval.status == "granted"),
                 "approval_required": True,
                 "approval_source": "local CLI only",
@@ -746,8 +795,9 @@ def build_server(store: Store | None = None) -> FastMCP:
                 "strategy": proposal.strategy,
                 "status": proposal.status,
                 "origin": proposal.origin,
-                "proposed_instruction": proposal.instruction_text,
-                "patch": proposal.patch,
+                "proposed_instruction": _bounded_text(proposal.instruction_text, MAX_PROPOSAL_TEXT),
+                "patch": _bounded_text(proposal.patch, MAX_DIFF_PREVIEW),
+                "patch_sha256": proposal.patch_sha256,
                 "approval_required": True,
                 "can_apply": False,
                 "human_approval_required": True,

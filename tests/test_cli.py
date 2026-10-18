@@ -223,6 +223,44 @@ class CliTestCase(unittest.TestCase):
 
         self.assertEqual(AGENTS_FIXTURE.read_bytes(), agents_before)
 
+    def test_fix_json_surfaces_hide_workspace_secrets(self) -> None:
+        """Every CLI JSON surface is sanitized, like the MCP surface.
+
+        The fix target lives in the workspace, so a credential inside it is not
+        covered by import-time trace redaction.
+        """
+        secret = "sk-proj-WORKSPACESECRETNOTREAL0000000000"
+        target = self.prepare_workspace()
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n- Export OPENAI_API_KEY={secret} before running tools.\n")
+
+        run_id = self.analyzed_run_id()
+        finding_id = self.fixable_finding_id(run_id)
+
+        proposed = self.invoke(
+            "fix", "propose", run_id, finding_id,
+            "--workspace", str(self.workspace), "--format", "json",
+        )
+        self.assertEqual(proposed.exit_code, 0, proposed.output)
+        payload = json.loads(proposed.stdout)
+        self.assertNotIn("original_content", payload)
+        self.assertNotIn(secret, proposed.stdout)
+        proposal_id = str(payload["proposal_id"])
+
+        diffed = self.invoke("fix", "diff", proposal_id, "--format", "json")
+        self.assertEqual(diffed.exit_code, 0, diffed.output)
+        self.assertNotIn(secret, diffed.stdout)
+        self.assertIn("[REDACTED", diffed.stdout)
+
+        listed = self.invoke("fix", "list", "--format", "json")
+        self.assertNotIn(secret, listed.stdout)
+
+        # Internal state keeps the exact patch, so an approval stays bound to the
+        # bytes that would actually be written.
+        stored = Store(self.data_dir).get_proposal(proposal_id)
+        self.assertIn(secret, stored.patch)
+        self.assertEqual(stored.patch_sha256, payload["patch_sha256"])
+
     def test_fix_approve_without_tty_is_refused(self) -> None:
         agents_before = AGENTS_FIXTURE.read_bytes()
         target = self.prepare_workspace()

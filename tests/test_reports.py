@@ -305,6 +305,37 @@ class TestJsonPayloads(unittest.TestCase):
         payload = reports.proposal_to_payload(proposal)
         self.assertEqual(payload["patch_sha256"], proposal.patch_sha256)
 
+    def test_proposal_payload_hides_internal_content_and_redacts_text(self) -> None:
+        """A workspace credential must not reach an outbound proposal payload."""
+        secret = "sk-proj-WORKSPACESECRETNOTREAL0000000000"
+        proposal = FixProposal(
+            proposal_id="prop_1",
+            run_id="run_1",
+            finding_id="TM001:grep:abc123",
+            code="TM001",
+            strategy="search_efficiency",
+            title="t",
+            rationale="r",
+            instruction_text="i",
+            workspace="/tmp/ws",
+            original_sha256="a" * 64,
+            original_content=f"OPENAI_API_KEY={secret}\n",
+            proposed_sha256="b" * 64,
+            patch=f"""+OPENAI_API_KEY={secret}
+""",
+        )
+
+        public = reports.proposal_to_payload(proposal)
+        self.assertNotIn("original_content", public)
+        self.assertNotIn(secret, json.dumps(public))
+        self.assertIn("[REDACTED", json.dumps(public))
+        # The hash still describes the exact patch that would be written.
+        self.assertEqual(proposal.patch_sha256, public["patch_sha256"])
+
+        internal = reports.proposal_to_payload(proposal, public=False)
+        self.assertEqual(proposal.patch, internal["patch"])
+        self.assertIn(secret, internal["patch"])
+
     def test_truncate_redacts_and_limits(self) -> None:
         text = reports.truncate("x" * 500 + " sk-proj-EXAMPLENOTAREALKEY000000000000", 20)
         self.assertLess(len(text), 60)

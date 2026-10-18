@@ -107,6 +107,18 @@ class MCPTestCase(unittest.IsolatedAsyncioTestCase):
         assert self.session is not None, "call() must run inside `async with self.client()`"
         return self.payload(await self.session.call_tool(name, arguments or {}))
 
+    async def call_result(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        """Raw result, so protocol-level fields such as `isError` stay visible."""
+        assert self.session is not None, "call_result() must run inside `async with self.client()`"
+        return await self.session.call_tool(name, arguments or {})
+
+    def seed_workspace_secret(self) -> str:
+        """Append a synthetic credential to the workspace fix target."""
+        secret = "sk-proj-WORKSPACESECRETNOTREAL0000000000"
+        with self.target_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n- Export OPENAI_API_KEY={secret} before running tools.\n")
+        return secret
+
     async def loaded_run(self) -> str:
         payload = await self.call("load_trace", {"path": str(TRACE_FIXTURE)})
         self.assertNotIn("error", payload, payload)
@@ -327,6 +339,70 @@ class MCPTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.original_target, self.target_file.read_bytes())
             self.assertEqual("pending", self.store.get_proposal(proposal["proposal_id"]).status)
 
+    async def test_workspace_secret_never_reaches_a_response(self) -> None:
+        """A credential in the workspace file must not travel out through MCP.
+
+        Import-time redaction cannot protect this: the fix target is a file in the
+        user's workspace, not part of the imported trace. `original_content` used to
+        carry the whole file into every proposal payload.
+        """
+        async with self.client():
+            secret = self.seed_workspace_secret()
+            run_id, findings = await self.analyzed_run()
+            finding_id = await self._fixable_finding(findings)
+            arguments = {
+                "run_id": run_id,
+                "finding_id": finding_id,
+                "workspace": str(self.workspace),
+            }
+
+            proposal = await self.call("propose_fix", arguments)
+            self.assertNotIn("error", proposal, proposal)
+            self.assertNotIn("original_content", proposal)
+            self.assertNotIn(secret, json.dumps(proposal))
+
+            proposal_id = proposal["proposal_id"]
+            preview = await self.call("preview_fix", {"proposal_id": proposal_id})
+            self.assertNotIn("error", preview, preview)
+            self.assertNotIn("original_content", preview)
+            self.assertNotIn(secret, json.dumps(preview))
+
+            others = [item["id"] for item in findings if item["fixable"] and item["id"] != finding_id]
+            self.assertTrue(others, "the fixture must offer a second fixable finding")
+            submitted = await self.call(
+                "submit_ai_fix_proposal",
+                {
+                    "run_id": run_id,
+                    "finding_id": others[0],
+                    "workspace": str(self.workspace),
+                    "proposed_instruction": "Reuse one search per file.",
+                },
+            )
+            self.assertNotIn("error", submitted, submitted)
+            self.assertNotIn(secret, json.dumps(submitted))
+
+            # The redaction is doing real work: the internal record still holds the
+            # file and the exact patch, and the approval hashes stay bound to it.
+            stored = self.store.get_proposal(proposal_id)
+            self.assertIn(secret, stored.original_content)
+            self.assertIn(secret, stored.patch)
+            self.assertIn("[REDACTED", preview["diff"])
+            self.assertEqual(stored.patch_sha256, proposal["patch_sha256"])
+
+    async def test_tool_failures_report_is_error(self) -> None:
+        """A failed call must not look like a successful tool result."""
+        async with self.client():
+            failed = await self.call_result("preview_fix", {"proposal_id": "proposal_missing"})
+            self.assertTrue(failed.isError)
+            payload = self.payload(failed)
+            self.assertIn("error", payload, payload)
+            self.assertTrue(payload["message"])
+            self.assertNotIn("Traceback", json.dumps(payload))
+
+            succeeded = await self.call_result("load_trace", {"path": str(TRACE_FIXTURE)})
+            self.assertFalse(succeeded.isError)
+            self.assertNotIn("error", self.payload(succeeded))
+
     async def test_apply_after_cli_approval_then_undo(self) -> None:
         async with self.client():
             run_id, findings = await self.analyzed_run()
@@ -438,7 +514,9 @@ class MCPTestCase(unittest.IsolatedAsyncioTestCase):
             ]
             for name, arguments in cases:
                 with self.subTest(tool=name, arguments=arguments):
-                    payload = await self.call(name, arguments)
+                    result = await self.call_result(name, arguments)
+                    self.assertTrue(result.isError, f"{name} must signal the failure")
+                    payload = self.payload(result)
                     self.assertIn("error", payload, payload)
                     self.assertTrue(payload["message"])
                     self.assertIsInstance(payload["error"], str)

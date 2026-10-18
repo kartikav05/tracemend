@@ -4,19 +4,29 @@ The public surface is deliberately tiny:
 
 ``detect_format(payload)``
     Decide whether a decoded JSON payload is ``"generic"`` (TraceMend's own
-    format) or ``"opencode"`` (an OpenCode session export). Raises
-    :class:`UnsupportedFormatError` when neither can be recognised.
+    format), ``"opencode"`` (an OpenCode session export), ``"claude-code"`` (a
+    Claude Code transcript row) or ``"cursor"`` (a Cursor CLI/hook record).
+    Raises :class:`UnsupportedFormatError` when nothing can be recognised.
 
 ``load_trace_file(path, format=None, *, max_bytes=MAX_TRACE_BYTES)``
     Read a trace from disk through :func:`security.read_text_limited` (so the
-    size ceiling is enforced), hash the raw bytes, parse the JSON and return a
-    :class:`TraceRun`. Invalid JSON raises :class:`TraceParseError` with a hint.
+    size ceiling is enforced), hash the raw bytes, parse the JSON/JSONL and
+    return a :class:`TraceRun`. Invalid input raises :class:`TraceParseError`
+    with a hint (JSONL errors always carry a line number).
 
 ``load_trace_text(text, *, format=None, source_path=None)``
     Same, for text already in memory.
 
 ``summarise(run, *, skipped=0, redaction_count=0)``
     Build the :class:`ImportSummary` the CLI/MCP layer reports back.
+
+JSON documents keep the original behaviour: a single object is decoded first
+and routed by :func:`detect_format`. Only when that fails *and* the first line is
+a self-contained JSON object does the loader treat the input as JSON Lines
+(bounded by :data:`adapters.jsonl.MAX_JSONL_RECORDS` and
+``MAX_JSONL_LINE_BYTES``). Existing generic/OpenCode payloads therefore can
+never be re-interpreted as JSONL, and a broken JSONL row is an error rather than
+a silently skipped record.
 
 Guarantees shared by every adapter:
 
@@ -41,30 +51,61 @@ from typing import Any
 
 from ..errors import TraceParseError, UnsupportedFormatError
 from ..models import ImportSummary, TraceRun
-from ..security import MAX_TRACE_BYTES, read_text_limited, sha256_file
+from ..security import MAX_TRACE_BYTES, read_text_limited, redact_text, sha256_file
+from .claude_code import matches_record as _matches_claude
+from .claude_code import parse_claude_code
+from .cursor import matches_record as _matches_cursor
+from .cursor import parse_cursor
 from .generic import parse_generic
+from .jsonl import looks_like_jsonl, parse_jsonl
 from .opencode import parse_opencode
 
 __all__ = [
+    "JSONL_FORMATS",
     "SUPPORTED_FORMATS",
     "detect_format",
+    "detect_jsonl_format",
     "load_trace_file",
     "load_trace_text",
+    "parse_claude_code",
+    "parse_cursor",
     "parse_generic",
     "parse_opencode",
     "summarise",
 ]
 
 #: Trace formats this build can ingest.
-SUPPORTED_FORMATS: tuple[str, ...] = ("generic", "opencode")
+SUPPORTED_FORMATS: tuple[str, ...] = ("generic", "opencode", "claude-code", "cursor")
+#: Formats that are read as JSON Lines / NDJSON.
+JSONL_FORMATS: frozenset[str] = frozenset({"claude-code", "cursor"})
 
 _SUPPORTED_HINT = (
-    "Supported formats: 'generic' (TraceMend generic JSON with an 'events' array) "
-    "and 'opencode' (an OpenCode session export with 'messages'/'info'). "
-    "Pass format='generic' or format='opencode' to force a parser."
+    "Supported formats: 'generic' (TraceMend generic JSON with an 'events' array), "
+    "'opencode' (an OpenCode session export with 'messages'/'info'), 'claude-code' "
+    "(a Claude Code JSONL transcript) and 'cursor' (Cursor CLI stream-json or hook "
+    "JSONL). Pass format='generic', 'opencode', 'claude-code' or 'cursor' to force "
+    "a parser."
 )
 
-_PARSERS = {"generic": parse_generic, "opencode": parse_opencode}
+_PARSERS = {
+    "generic": parse_generic,
+    "opencode": parse_opencode,
+    "claude-code": parse_claude_code,
+    "cursor": parse_cursor,
+}
+
+#: Tolerated spellings for an explicit/MCP format override.
+_FORMAT_ALIASES = {
+    "claude": "claude-code",
+    "claude_code": "claude-code",
+    "claudecode": "claude-code",
+    "cursor_cli": "cursor",
+    "cursor-cli": "cursor",
+    "cursor_ide": "cursor",
+    "cursor-ide": "cursor",
+    "cursor_hooks": "cursor",
+    "cursor-hooks": "cursor",
+}
 
 #: Keys that only show up in OpenCode-style tool call entries.
 _OPENCODE_MARKERS = frozenset({"state", "input", "time", "parts", "tool_call"})
@@ -76,13 +117,18 @@ _GENERIC_MARKERS = frozenset(
 
 
 def _normalise_format_name(name: str) -> str:
-    return name.strip().lower()
+    key = name.strip().lower()
+    return _FORMAT_ALIASES.get(key, key)
 
 
 def _format_from_declared(declared: str) -> str:
     key = _normalise_format_name(declared)
     if "opencode" in key:
         return "opencode"
+    if "claude" in key:
+        return "claude-code"
+    if "cursor" in key:
+        return "cursor"
     if key.startswith("tracemend") or key in {"generic", "tracemend", "tracemend.generic"}:
         return "generic"
     if key in SUPPORTED_FORMATS:
@@ -125,10 +171,12 @@ def _classify_tool_calls(calls: list[Any]) -> str:
 
 
 def detect_format(payload: dict) -> str:
-    """Return ``"generic"`` or ``"opencode"`` for a decoded trace payload.
+    """Return the adapter id for a decoded JSON trace payload.
 
     An explicit ``format`` field wins outright; otherwise the top-level keys are
-    inspected. Raises :class:`UnsupportedFormatError` when nothing matches.
+    inspected. Existing generic/OpenCode shapes are checked first so a native
+    Claude Code or Cursor marker can never steal them. Raises
+    :class:`UnsupportedFormatError` when nothing matches.
     """
     if not isinstance(payload, dict):
         raise UnsupportedFormatError(
@@ -148,12 +196,62 @@ def detect_format(payload: dict) -> str:
         return "generic"
     if isinstance(payload.get("tool_calls"), list):
         return _classify_tool_calls(payload["tool_calls"])
+    if _matches_claude(payload):
+        return "claude-code"
+    if _matches_cursor(payload):
+        return "cursor"
 
     raise UnsupportedFormatError(
         "could not detect the trace format: expected an 'events' or 'tool_calls' "
-        "array, or OpenCode 'messages'/'info' keys",
+        "array, OpenCode 'messages'/'info' keys, a Claude Code transcript row or a "
+        "Cursor stream-json/hook record",
         hint=_SUPPORTED_HINT,
     )
+
+
+def detect_jsonl_format(rows: list[dict]) -> str:
+    """Identify a native adapter from decoded JSONL rows.
+
+    Only rows recognised by a native adapter count; mixed or absent markers are a
+    clear error rather than a guess.
+    """
+    sample = [row for row in rows[:50] if isinstance(row, dict)]
+    claude_score = sum(1 for row in sample if _matches_claude(row))
+    cursor_score = sum(1 for row in sample if _matches_cursor(row))
+    if claude_score and not cursor_score:
+        return "claude-code"
+    if cursor_score and not claude_score:
+        return "cursor"
+    if claude_score and cursor_score:
+        raise UnsupportedFormatError(
+            "could not detect the JSONL format: the input mixes Claude Code and Cursor records",
+            hint=_SUPPORTED_HINT,
+        )
+    raise UnsupportedFormatError(
+        "could not detect the JSONL format: no Claude Code or Cursor record markers found",
+        hint=_SUPPORTED_HINT,
+    )
+
+
+def _run_parser(
+    resolved: str,
+    payload: Any,
+    *,
+    source_path: str | None,
+    digest: str | None,
+) -> TraceRun:
+    parser = _PARSERS[resolved]
+    try:
+        return parser(payload, source_path=source_path, digest=digest)
+    except TraceParseError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive, shape-dependent
+        detail, _ = redact_text(str(exc))
+        raise TraceParseError(
+            f"could not parse {resolved} trace: {detail}",
+            hint="The trace did not match the expected export shape; "
+            "re-export it or open an issue with the payload.",
+        ) from exc
 
 
 def _load_text(
@@ -175,9 +273,23 @@ def _load_text(
             hint="Point TraceMend at a JSON trace file or paste a session export.",
         )
 
+    if format in JSONL_FORMATS:
+        # A single pretty-printed record (or a JSON array of rows) is a valid
+        # one-record transcript; everything else is decoded line by line.
+        try:
+            document = json.loads(stripped)
+        except json.JSONDecodeError:
+            document = None
+        payload: Any = document if isinstance(document, (dict, list)) else parse_jsonl(text)
+        return _run_parser(format, payload, source_path=source_path, digest=digest)
+
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError as exc:
+        if format is None and looks_like_jsonl(stripped):
+            rows = parse_jsonl(text)
+            resolved = detect_jsonl_format(rows)
+            return _run_parser(resolved, rows, source_path=source_path, digest=digest)
         raise TraceParseError(
             f"invalid JSON at line {exc.lineno} column {exc.colno}: {exc.msg}",
             hint="TraceMend expects a JSON object with double-quoted keys; "
@@ -191,17 +303,7 @@ def _load_text(
         )
 
     resolved = format or detect_format(payload)
-    parser = _PARSERS[resolved]
-    try:
-        return parser(payload, source_path=source_path, digest=digest)
-    except TraceParseError:
-        raise
-    except Exception as exc:  # pragma: no cover - defensive, shape-dependent
-        raise TraceParseError(
-            f"could not parse {resolved} trace: {exc}",
-            hint="The trace did not match the expected export shape; "
-            "re-export it or open an issue with the payload.",
-        ) from exc
+    return _run_parser(resolved, payload, source_path=source_path, digest=digest)
 
 
 def load_trace_file(
